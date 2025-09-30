@@ -21,7 +21,7 @@ if not TOKEN and os.path.exists("token.txt"):
         TOKEN = f.read().strip()
 
 # Human-facing time format. Interpreted as *server local time* on input.
-TIME_FMT = "%Y-%m-%d %H:%M"  # e.g. 2025-09-30 20:30
+TIME_FMT = "%H:%M %d.%m.%Y"  # e.g. 22:00 30.09.2025
 
 # ===================== Logging =====================
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s %(name)s: %(message)s")
@@ -567,7 +567,7 @@ def _selftest() -> None:
     except ValueError:
         pass
     # parse_time_local returns UTC-aware dt
-    dt = parse_time_local("2025-09-30 20:30")
+    dt = parse_time_local("20:30 30.09.2025")
     assert dt.tzinfo == timezone.utc
     # Raid without start time keeps None
     raid = Raid(
