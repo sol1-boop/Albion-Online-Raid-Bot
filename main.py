@@ -10,6 +10,7 @@ import commands as raid_commands
 import db
 from config import TOKEN, log
 from views import SignupView
+from scheduler import ReminderService
 
 
 def create_bot() -> discord_commands.Bot:
@@ -21,6 +22,7 @@ def create_bot() -> discord_commands.Bot:
 
 
 bot = create_bot()
+reminders = ReminderService(bot)
 
 
 @bot.event
@@ -34,6 +36,7 @@ async def on_ready() -> None:
     log.info("Logged in as %s (ID: %s)", bot.user, getattr(bot.user, "id", "unknown"))
     for raid_id in db.list_raid_ids():
         bot.add_view(SignupView(raid_id))
+    reminders.start()
 
 
 def main(argv: list[str] | None = None) -> None:

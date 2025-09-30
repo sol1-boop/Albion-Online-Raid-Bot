@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import List
+from typing import List, Tuple
 
 import discord
 
@@ -30,6 +30,7 @@ class RoleSelect(discord.ui.Select):
             min_values=1,
             max_values=1,
             options=options,
+            custom_id=f"raid:{raid_id}:role",
         )
         self.raid_id = raid_id
 
@@ -40,7 +41,11 @@ class RoleSelect(discord.ui.Select):
 
 class LeaveButton(discord.ui.Button):
     def __init__(self, raid_id: int):
-        super().__init__(label="Снять запись", style=discord.ButtonStyle.secondary)
+        super().__init__(
+            label="Снять запись",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"raid:{raid_id}:leave",
+        )
         self.raid_id = raid_id
 
     async def callback(self, interaction: discord.Interaction) -> None:  # pragma: no cover - UI callback
@@ -59,32 +64,80 @@ async def handle_signup(interaction: discord.Interaction, raid_id: int, role_nam
         return
 
     current_signup = db.get_user_signup(raid_id, interaction.user.id)
+    wait_entry = db.get_waitlist_entry(raid_id, interaction.user.id)
     signups = db.get_signups(raid_id)
-    signups_without_user = [s for s in signups if s.user_id != interaction.user.id]
-
-    total_after = len(signups_without_user) + 1
-    if total_after > raid.max_participants:
-        await interaction.response.send_message("Лимит участников достигнут.", ephemeral=True)
-        return
-
-    role_after = len([s for s in signups_without_user if s.role_name == role_name]) + 1
-    if role_after > roles[role_name]:
-        await interaction.response.send_message("Лимит по этой роли достигнут.", ephemeral=True)
-        return
+    other_signups = [s for s in signups if s.user_id != interaction.user.id]
+    total_count = len(other_signups) + (1 if current_signup else 0)
+    role_counts: dict[str, int] = {name: 0 for name in roles}
+    for signup in other_signups:
+        if signup.role_name in role_counts:
+            role_counts[signup.role_name] += 1
 
     if current_signup:
+        if current_signup.role_name == role_name:
+            await interaction.response.send_message(
+                "Вы уже записаны на эту роль.", ephemeral=True
+            )
+            return
+        if role_counts[role_name] >= roles[role_name]:
+            await interaction.response.send_message("Лимит по этой роли достигнут.", ephemeral=True)
+            return
         db.update_signup_role(raid_id, interaction.user.id, role_name)
-    else:
+        promotions = await sync_roster(interaction.client, raid)
+        await announce_promotions(interaction.client, raid, promotions)
+        await interaction.response.send_message(
+            f"Ваша роль обновлена на **{role_name}**.", ephemeral=True
+        )
+        return
+
+    available_slot = total_count < raid.max_participants and role_counts[role_name] < roles[role_name]
+
+    if wait_entry:
+        if available_slot:
+            db.remove_waitlist_entry(raid_id, interaction.user.id)
+            db.add_signup(
+                raid_id,
+                interaction.user.id,
+                role_name,
+                int(datetime.now(tz=timezone.utc).timestamp()),
+            )
+            promotions = await sync_roster(interaction.client, raid)
+            await announce_promotions(interaction.client, raid, promotions)
+            await interaction.response.send_message(
+                "Место освободилось, вы добавлены в основной состав!", ephemeral=True
+            )
+        else:
+            db.update_waitlist_role(raid_id, interaction.user.id, role_name)
+            await refresh_message(interaction.client, raid)
+            await interaction.response.send_message(
+                "Ваш запрос обновлён, вы остаетесь в резерве.", ephemeral=True
+            )
+        return
+
+    if available_slot:
         db.add_signup(
             raid_id,
             interaction.user.id,
             role_name,
             int(datetime.now(tz=timezone.utc).timestamp()),
         )
+        promotions = await sync_roster(interaction.client, raid)
+        await announce_promotions(interaction.client, raid, promotions)
+        await interaction.response.send_message(
+            f"Вы записались как **{role_name}**.", ephemeral=True
+        )
+        return
 
+    db.add_waitlist_entry(
+        raid_id,
+        interaction.user.id,
+        role_name,
+        int(datetime.now(tz=timezone.utc).timestamp()),
+    )
     await refresh_message(interaction.client, raid)
     await interaction.response.send_message(
-        f"Вы записались как **{role_name}**.", ephemeral=True
+        "Лимит достигнут, вы добавлены в резерв и получите место автоматически.",
+        ephemeral=True,
     )
 
 
@@ -94,7 +147,9 @@ async def handle_unsubscribe(interaction: discord.Interaction, raid_id: int) -> 
         await interaction.response.send_message("Событие не найдено.", ephemeral=True)
         return
     db.remove_signup(raid_id, interaction.user.id)
-    await refresh_message(interaction.client, raid)
+    db.remove_waitlist_entry(raid_id, interaction.user.id)
+    promotions = await sync_roster(interaction.client, raid)
+    await announce_promotions(interaction.client, raid, promotions)
     await interaction.response.send_message("Запись снята.", ephemeral=True)
 
 
@@ -110,14 +165,44 @@ async def refresh_message(client: discord.Client, raid: Raid) -> None:
         return
     roles = db.get_roles(raid.id)
     signups = db.get_signups(raid.id)
-    await msg.edit(embed=make_embed(raid, roles, signups), view=SignupView(raid.id))
+    waitlist = db.get_waitlist(raid.id)
+    await msg.edit(
+        embed=make_embed(raid, roles, signups, waitlist),
+        view=SignupView(raid.id),
+    )
+
+
+async def sync_roster(client: discord.Client, raid: Raid) -> List[Tuple[int, str]]:
+    promoted = db.promote_waitlist(raid.id)
+    await refresh_message(client, raid)
+    return promoted
+
+
+async def announce_promotions(
+    client: discord.Client, raid: Raid, promotions: List[Tuple[int, str]]
+) -> None:
+    if not promotions:
+        return
+    channel = client.get_channel(raid.channel_id)
+    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+        return
+    mentions = ", ".join(f"<@{user_id}>" for user_id, _ in promotions)
+    roles = ", ".join(f"{role}" for _, role in promotions)
+    try:
+        await channel.send(
+            f"{mentions}, для вас освободились места ({roles}). Добро пожаловать в состав!"
+        )
+    except discord.HTTPException:  # pragma: no cover - ignore send errors
+        pass
 
 
 __all__ = [
     "LeaveButton",
     "RoleSelect",
     "SignupView",
+    "announce_promotions",
     "handle_signup",
     "handle_unsubscribe",
     "refresh_message",
+    "sync_roster",
 ]
