@@ -93,11 +93,15 @@ def test_signup_flow_and_limits(monkeypatch, tmp_path) -> None:
                 self.id = user_id
                 self.guild_permissions = DummyPerms()
 
+        class DummyClient:
+            def get_channel(self, *_: int):
+                return None
+
         class DummyInteraction:
             def __init__(self, user_id: int) -> None:
                 self.user = DummyUser(user_id)
                 self.response = DummyResponse()
-                self.client = object()
+                self.client = DummyClient()
 
         async def run_flow() -> None:
             interaction = DummyInteraction(100)
@@ -111,10 +115,15 @@ def test_signup_flow_and_limits(monkeypatch, tmp_path) -> None:
             from commands import raid_edit
 
             await raid_edit.callback(edit_interaction, raid_id, max_participants=1)
-            assert any("Сняты" in (msg or "") for msg in edit_interaction.response.messages)
+            assert any(
+                "Перемещены" in (msg or "") or "Событие обновлено" in (msg or "")
+                for msg in edit_interaction.response.messages
+            )
             signups_after = db.get_signups(raid_id)
             assert len(signups_after) == 1
             assert signups_after[0].user_id == 100
+            waitlist = db.get_waitlist(raid_id)
+            assert waitlist and waitlist[0].user_id == 200
 
         import asyncio
 

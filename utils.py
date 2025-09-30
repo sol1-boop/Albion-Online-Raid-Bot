@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Mapping, Sequence, Tuple
 
 from config import TIME_FMT
-from models import Raid, Signup
+from models import Raid, Signup, WaitlistEntry
 
 if TYPE_CHECKING:
     import discord
@@ -68,11 +68,36 @@ def build_roster_text(roles: Mapping[str, int], signups: Sequence[Signup]) -> Tu
     return "\n".join(lines), total
 
 
+def build_waitlist_text(roles: Mapping[str, int], waitlist: Sequence[WaitlistEntry]) -> str:
+    if not waitlist:
+        return ""
+    by_role: dict[str, list[int]] = {}
+    for entry in waitlist:
+        by_role.setdefault(entry.role_name, []).append(entry.user_id)
+    lines: list[str] = []
+    for role_name in roles:
+        members = by_role.get(role_name)
+        if not members:
+            continue
+        mentions = ", ".join(f"<@{user_id}>" for user_id in members)
+        lines.append(f"**{role_name}**: {mentions}")
+    for role_name, members in by_role.items():
+        if role_name in roles:
+            continue
+        mentions = ", ".join(f"<@{user_id}>" for user_id in members)
+        lines.append(f"**{role_name}**: {mentions} (ожидает роли)")
+    return "\n".join(lines)
+
+
 def make_embed(
-    raid: Raid, roles: Mapping[str, int], signups: Sequence[Signup]
+    raid: Raid,
+    roles: Mapping[str, int],
+    signups: Sequence[Signup],
+    waitlist: Sequence[WaitlistEntry],
 ) -> "discord.Embed":
     import discord
     roster_text, total = build_roster_text(roles, signups)
+    waitlist_text = build_waitlist_text(roles, waitlist)
     starts_dt = raid.starts_dt
     if starts_dt:
         starts_dt_local = starts_dt.astimezone()
@@ -86,11 +111,14 @@ def make_embed(
     if raid.comment:
         embed.add_field(name="Комментарий", value=raid.comment, inline=False)
     embed.add_field(name="Состав", value=roster_text or "—", inline=False)
+    if waitlist_text:
+        embed.add_field(name="Резерв", value=waitlist_text, inline=False)
     embed.set_footer(text=f"ID события: {raid.id}")
     return embed
 
 
 __all__ = [
+    "build_waitlist_text",
     "build_roster_text",
     "ensure_permissions",
     "make_embed",

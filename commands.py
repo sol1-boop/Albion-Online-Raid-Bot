@@ -10,9 +10,12 @@ from discord import app_commands
 import db
 from config import TIME_FMT
 from utils import ensure_permissions, make_embed, parse_roles, parse_time_local
-from views import SignupView, refresh_message
+from views import SignupView, announce_promotions, refresh_message, sync_roster
 
 raid_group = app_commands.Group(name="raid", description="Рейдовые события Albion Online")
+template_group = app_commands.Group(
+    name="template", description="Шаблоны рейдов", parent=raid_group
+)
 
 PERMISSION_ERROR = (
     "Недостаточно прав: только создатель события или модератор с Manage Events."
@@ -55,9 +58,190 @@ async def raid_create(
 
     raid = db.fetch_raid(raid_id)
     assert raid is not None
+    db.reset_raid_reminders(raid_id, raid.starts_at)
     roles_data = db.get_roles(raid_id)
     signups = db.get_signups(raid_id)
-    embed = make_embed(raid, roles_data, signups)
+    waitlist = db.get_waitlist(raid_id)
+    embed = make_embed(raid, roles_data, signups, waitlist)
+    view = SignupView(raid.id)
+    await interaction.response.send_message(embed=embed, view=view)
+    msg = await interaction.original_response()
+    db.update_message_id(raid_id, msg.id)
+
+
+@template_group.command(name="create", description="Создать или обновить шаблон")
+@app_commands.describe(
+    template_name="Название шаблона",
+    max_participants="Лимит участников",
+    roles="Роли и лимиты в формате tank:2, healer:3",
+    comment="Комментарий по умолчанию (опционально)",
+)
+async def template_create(
+    interaction: discord.Interaction,
+    template_name: str,
+    max_participants: app_commands.Range[int, 1, 1000],
+    roles: str,
+    comment: Optional[str] = None,
+) -> None:
+    try:
+        roles_map = dict(parse_roles(roles))
+    except Exception as exc:
+        await interaction.response.send_message(f"Ошибка ролей: {exc}", ephemeral=True)
+        return
+    db.save_template(
+        guild_id=int(interaction.guild_id),
+        name=template_name,
+        max_participants=int(max_participants),
+        roles=roles_map,
+        comment=comment or "",
+    )
+    await interaction.response.send_message(
+        f"Шаблон **{template_name}** сохранён.", ephemeral=True
+    )
+
+
+@template_group.command(name="list", description="Показать шаблоны сервера")
+async def template_list(interaction: discord.Interaction) -> None:
+    templates = db.list_templates(int(interaction.guild_id))
+    if not templates:
+        await interaction.response.send_message("Шаблонов пока нет.", ephemeral=True)
+        return
+    lines: list[str] = []
+    for tpl in templates:
+        roles_text = ", ".join(f"{role}:{cap}" for role, cap in tpl.roles.items())
+        lines.append(
+            f"**{tpl.name}** • лимит {tpl.max_participants} • роли: {roles_text}"
+        )
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
+@template_group.command(name="delete", description="Удалить шаблон")
+@app_commands.describe(template_name="Название шаблона")
+async def template_delete(interaction: discord.Interaction, template_name: str) -> None:
+    deleted = db.delete_template(int(interaction.guild_id), template_name)
+    if deleted:
+        message = f"Шаблон **{template_name}** удалён."
+    else:
+        message = "Шаблон не найден."
+    await interaction.response.send_message(message, ephemeral=True)
+
+
+@template_group.command(name="use", description="Создать событие по шаблону")
+@app_commands.describe(
+    template_name="Название шаблона",
+    name="Название события",
+    starts_at=f"Время старта {TIME_FMT} (опционально)",
+    max_participants="Переопределить лимит (опционально)",
+    comment="Переопределить комментарий (опционально)",
+)
+async def template_use(
+    interaction: discord.Interaction,
+    template_name: str,
+    name: str,
+    starts_at: Optional[str] = None,
+    max_participants: Optional[int] = None,
+    comment: Optional[str] = None,
+) -> None:
+    template = db.fetch_template(int(interaction.guild_id), template_name)
+    if not template:
+        await interaction.response.send_message("Шаблон не найден.", ephemeral=True)
+        return
+    if not template.roles:
+        await interaction.response.send_message(
+            "В шаблоне нет ролей, создание невозможно.", ephemeral=True
+        )
+        return
+
+    starts_ts = 0
+    if starts_at:
+        try:
+            dt_utc = parse_time_local(starts_at)
+        except Exception as exc:
+            await interaction.response.send_message(f"Ошибка времени: {exc}", ephemeral=True)
+            return
+        starts_ts = int(dt_utc.timestamp())
+
+    raid_id = db.create_raid(
+        guild_id=int(interaction.guild_id),
+        channel_id=int(interaction.channel_id),
+        name=name,
+        starts_at=starts_ts,
+        comment=comment if comment is not None else template.comment,
+        max_participants=int(max_participants) if max_participants is not None else template.max_participants,
+        created_by=interaction.user.id,
+        roles=template.roles,
+    )
+
+    raid = db.fetch_raid(raid_id)
+    assert raid is not None
+    db.reset_raid_reminders(raid_id, raid.starts_at)
+    roles_data = db.get_roles(raid_id)
+    signups = db.get_signups(raid_id)
+    waitlist = db.get_waitlist(raid_id)
+    embed = make_embed(raid, roles_data, signups, waitlist)
+    view = SignupView(raid.id)
+    await interaction.response.send_message(embed=embed, view=view)
+    msg = await interaction.original_response()
+    db.update_message_id(raid_id, msg.id)
+
+
+@raid_group.command(name="clone", description="Клонировать существующее событие")
+@app_commands.describe(
+    source_raid_id="ID события для копирования",
+    name="Название нового события",
+    starts_at=f"Новое время {TIME_FMT} (опционально)",
+    max_participants="Новый лимит (опционально)",
+    comment="Комментарий (опционально, по умолчанию как у исходного)",
+)
+async def raid_clone(
+    interaction: discord.Interaction,
+    source_raid_id: int,
+    name: str,
+    starts_at: Optional[str] = None,
+    max_participants: Optional[int] = None,
+    comment: Optional[str] = None,
+) -> None:
+    source = db.fetch_raid(source_raid_id)
+    if not source:
+        await interaction.response.send_message("Исходное событие не найдено.", ephemeral=True)
+        return
+    try:
+        roles_map = db.get_roles(source_raid_id)
+    except Exception:
+        roles_map = {}
+    if not roles_map:
+        await interaction.response.send_message(
+            "У исходного события нет ролей, клонирование невозможно.", ephemeral=True
+        )
+        return
+
+    starts_ts = source.starts_at
+    if starts_at:
+        try:
+            dt_utc = parse_time_local(starts_at)
+        except Exception as exc:
+            await interaction.response.send_message(f"Ошибка времени: {exc}", ephemeral=True)
+            return
+        starts_ts = int(dt_utc.timestamp())
+
+    raid_id = db.create_raid(
+        guild_id=int(interaction.guild_id),
+        channel_id=int(interaction.channel_id),
+        name=name,
+        starts_at=starts_ts,
+        comment=comment if comment is not None else source.comment,
+        max_participants=int(max_participants) if max_participants is not None else source.max_participants,
+        created_by=interaction.user.id,
+        roles=roles_map,
+    )
+
+    raid = db.fetch_raid(raid_id)
+    assert raid is not None
+    db.reset_raid_reminders(raid_id, raid.starts_at)
+    roles_data = db.get_roles(raid_id)
+    signups = db.get_signups(raid_id)
+    waitlist = db.get_waitlist(raid_id)
+    embed = make_embed(raid, roles_data, signups, waitlist)
     view = SignupView(raid.id)
     await interaction.response.send_message(embed=embed, view=view)
     msg = await interaction.original_response()
@@ -91,6 +275,7 @@ async def raid_edit(
         return
 
     kwargs: dict[str, object] = {}
+    new_starts_at: Optional[int] = None
     if name:
         kwargs["name"] = name
     if starts_at:
@@ -99,7 +284,8 @@ async def raid_edit(
         except Exception as exc:
             await interaction.response.send_message(f"Ошибка времени: {exc}", ephemeral=True)
             return
-        kwargs["starts_at"] = int(dt_utc.timestamp())
+        new_starts_at = int(dt_utc.timestamp())
+        kwargs["starts_at"] = new_starts_at
     if max_participants is not None:
         kwargs["max_participants"] = int(max_participants)
     if comment is not None:
@@ -116,17 +302,32 @@ async def raid_edit(
             return
         db.replace_roles(raid_id, new_roles)
 
-    removed_signups = db.enforce_signup_limits(raid_id)
+    limit_changes = db.enforce_signup_limits(raid_id)
     updated_raid = db.fetch_raid(raid_id)
-    if updated_raid:
-        await refresh_message(interaction.client, updated_raid)
+    if updated_raid and new_starts_at is not None:
+        db.reset_raid_reminders(raid_id, updated_raid.starts_at)
 
-    if removed_signups:
-        removed_text = ", ".join(f"<@{uid}> ({role})" for uid, role in removed_signups)
-        message = "Событие обновлено. Сняты из-за новых лимитов: " + removed_text
-    else:
-        message = "Событие обновлено."
-    await interaction.response.send_message(message, ephemeral=True)
+    promotions: list[tuple[int, str]] = []
+    if updated_raid:
+        promotions = await sync_roster(interaction.client, updated_raid)
+        await announce_promotions(interaction.client, updated_raid, promotions)
+
+    parts = ["Событие обновлено."]
+    waitlisted = limit_changes.get("waitlisted", [])
+    removed = limit_changes.get("removed", [])
+    if waitlisted:
+        wait_text = ", ".join(f"<@{uid}> ({role})" for uid, role in waitlisted)
+        parts.append("Перемещены в резерв: " + wait_text + ".")
+    if removed:
+        removed_text = ", ".join(f"<@{uid}> ({role})" for uid, role in removed)
+        parts.append(
+            "Удалены из состава из-за отсутствия роли: " + removed_text + "."
+        )
+    if promotions:
+        promo_text = ", ".join(f"<@{uid}> ({role})" for uid, role in promotions)
+        parts.append("Автоматически добавлены из резерва: " + promo_text + ".")
+
+    await interaction.response.send_message(" ".join(parts), ephemeral=True)
 
 
 @raid_group.command(name="delete", description="Удалить событие")
@@ -162,7 +363,10 @@ async def raid_view(interaction: discord.Interaction, raid_id: int) -> None:
         return
     roles = db.get_roles(raid_id)
     signups = db.get_signups(raid_id)
-    await interaction.response.send_message(embed=make_embed(raid, roles, signups), view=SignupView(raid.id))
+    waitlist = db.get_waitlist(raid_id)
+    await interaction.response.send_message(
+        embed=make_embed(raid, roles, signups, waitlist), view=SignupView(raid.id)
+    )
 
 
 @raid_group.command(name="list", description="Список ближайших событий")
