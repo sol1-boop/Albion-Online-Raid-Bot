@@ -87,14 +87,16 @@ class Raid:
     channel_id: int
     message_id: Optional[int]
     name: str
-    starts_at: int  # epoch seconds UTC
+    starts_at: int  # epoch seconds UTC or 0 if не указано
     comment: str
     max_participants: int
     created_by: int
     created_at: int
 
     @property
-    def starts_dt(self) -> datetime:
+    def starts_dt(self) -> Optional[datetime]:
+        if not self.starts_at:
+            return None
         return datetime.fromtimestamp(self.starts_at, tz=timezone.utc)
 
 
@@ -205,9 +207,15 @@ def build_roster_text(raid_id: int) -> Tuple[str, int]:
 
 def make_embed(raid: Raid) -> discord.Embed:
     roster_text, total = build_roster_text(raid.id)
-    starts_dt_local = raid.starts_dt.astimezone()  # server local timezone for display
+    starts_dt = raid.starts_dt
+    if starts_dt:
+        starts_dt_local = starts_dt.astimezone()  # server local timezone for display
+        start_value = f"{starts_dt_local.strftime(TIME_FMT)} (локальное время сервера)"
+    else:
+        start_value = "Не указано"
+
     e = discord.Embed(title=f"🎯 {raid.name}", color=discord.Color.blurple())
-    e.add_field(name="Старт", value=f"{starts_dt_local.strftime(TIME_FMT)} (локальное время сервера)")
+    e.add_field(name="Старт", value=start_value)
     e.add_field(name="Лимит", value=f"{total}/{raid.max_participants}")
     if raid.comment:
         e.add_field(name="Комментарий", value=raid.comment, inline=False)
@@ -315,7 +323,7 @@ async def refresh_message(client: discord.Client, raid: Raid):
 @group.command(name="create", description="Создать рейдовое событие")
 @app_commands.describe(
     name="Название события",
-    starts_at=f"Время старта в формате {TIME_FMT} (локальное время сервера)",
+    starts_at=f"Время старта в формате {TIME_FMT} (локальное время сервера, опционально)",
     max_participants="Общий лимит участников",
     roles="Роли и лимиты в формате: tank:2, healer:3, dps:10",
     comment="Комментарий (опционально)",
@@ -323,13 +331,15 @@ async def refresh_message(client: discord.Client, raid: Raid):
 async def raid_create(
     interaction: discord.Interaction,
     name: str,
-    starts_at: str,
     max_participants: app_commands.Range[int, 1, 1000],
     roles: str,
+    starts_at: Optional[str] = None,
     comment: Optional[str] = None,
 ):
+    dt_utc: Optional[datetime] = None
     try:
-        dt_utc = parse_time_local(starts_at)
+        if starts_at:
+            dt_utc = parse_time_local(starts_at)
         roles_map = parse_roles(roles)
     except Exception as e:
         await interaction.response.send_message(f"Ошибка: {e}", ephemeral=True)
@@ -343,7 +353,7 @@ async def raid_create(
                 interaction.guild_id,
                 interaction.channel_id,
                 name,
-                int(dt_utc.timestamp()),
+                int(dt_utc.timestamp()) if dt_utc else 0,
                 comment or "",
                 int(max_participants),
                 interaction.user.id,
@@ -492,7 +502,14 @@ async def raid_list(
     now = int(datetime.now(tz=timezone.utc).timestamp())
     with with_conn() as conn:
         rows = conn.execute(
-            "SELECT * FROM raids WHERE guild_id = ? AND starts_at >= ? ORDER BY starts_at LIMIT ?",
+            """
+            SELECT *
+            FROM raids
+            WHERE guild_id = ?
+              AND (starts_at = 0 OR starts_at >= ?)
+            ORDER BY CASE WHEN starts_at = 0 THEN 0 ELSE 1 END, starts_at
+            LIMIT ?
+            """,
             (interaction.guild_id, now, int(limit)),
         ).fetchall()
     if not rows:
@@ -500,8 +517,12 @@ async def raid_list(
         return
     lines = []
     for r in rows:
-        dt = datetime.fromtimestamp(r["starts_at"], tz=timezone.utc).astimezone()
-        lines.append(f"`{r['id']}` • {dt.strftime(TIME_FMT)} • {r['name']}")
+        if r["starts_at"]:
+            dt = datetime.fromtimestamp(r["starts_at"], tz=timezone.utc).astimezone()
+            when = dt.strftime(TIME_FMT)
+        else:
+            when = "Без даты"
+        lines.append(f"`{r['id']}` • {when} • {r['name']}")
     await interaction.response.send_message("\n".join(lines))
 
 
@@ -548,6 +569,20 @@ def _selftest() -> None:
     # parse_time_local returns UTC-aware dt
     dt = parse_time_local("2025-09-30 20:30")
     assert dt.tzinfo == timezone.utc
+    # Raid without start time keeps None
+    raid = Raid(
+        id=1,
+        guild_id=1,
+        channel_id=1,
+        message_id=None,
+        name="Test",
+        starts_at=0,
+        comment="",
+        max_participants=1,
+        created_by=1,
+        created_at=1,
+    )
+    assert raid.starts_dt is None
 
 
 # ===================== Entrypoint =====================
