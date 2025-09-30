@@ -1,6 +1,8 @@
+import asyncio
 import os
 import logging
 import sqlite3
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
@@ -187,6 +189,78 @@ def get_signups(raid_id: int) -> List[sqlite3.Row]:
         ).fetchall()
 
 
+def get_user_signup(raid_id: int, user_id: int) -> Optional[sqlite3.Row]:
+    with with_conn() as conn:
+        return conn.execute(
+            "SELECT role_name, created_at FROM raid_signups WHERE raid_id = ? AND user_id = ?",
+            (raid_id, user_id),
+        ).fetchone()
+
+
+def enforce_signup_limits(raid_id: int) -> List[Tuple[int, str]]:
+    """Ensure signups obey current raid limits, trimming the latest entries if needed."""
+    with with_conn() as conn:
+        raid_row = conn.execute(
+            "SELECT max_participants FROM raids WHERE id = ?",
+            (raid_id,),
+        ).fetchone()
+    if not raid_row:
+        return []
+
+    max_participants = int(raid_row["max_participants"])
+    roles = get_roles(raid_id)
+    signups_rows = get_signups(raid_id)
+    signups = [
+        {
+            "user_id": row["user_id"],
+            "role_name": row["role_name"],
+            "created_at": row["created_at"],
+        }
+        for row in signups_rows
+    ]
+    to_remove: List[Dict[str, object]] = []
+    removed_ids = set()
+
+    # Enforce per-role capacities (keep earliest signups)
+    for role_name, cap in roles.items():
+        cap_int = int(cap)
+        role_signups = [s for s in signups if s["role_name"] == role_name and s["user_id"] not in removed_ids]
+        if len(role_signups) > cap_int:
+            for entry in role_signups[cap_int:]:
+                if entry["user_id"] not in removed_ids:
+                    to_remove.append(entry)
+                    removed_ids.add(entry["user_id"])
+
+    # Any signups for roles not present anymore should also be removed
+    for entry in signups:
+        if entry["user_id"] in removed_ids:
+            continue
+        if entry["role_name"] not in roles:
+            to_remove.append(entry)
+            removed_ids.add(entry["user_id"])
+
+    # Enforce total capacity (keep earliest signups)
+    remaining = [s for s in signups if s["user_id"] not in removed_ids]
+    if len(remaining) > max_participants:
+        overflow = remaining[max_participants:]
+        for entry in overflow:
+            if entry["user_id"] not in removed_ids:
+                to_remove.append(entry)
+                removed_ids.add(entry["user_id"])
+
+    if not to_remove:
+        return []
+
+    with with_conn() as conn:
+        conn.executemany(
+            "DELETE FROM raid_signups WHERE raid_id = ? AND user_id = ?",
+            [(raid_id, int(entry["user_id"])) for entry in to_remove],
+        )
+        conn.commit()
+
+    return [(int(entry["user_id"]), str(entry["role_name"])) for entry in to_remove]
+
+
 def build_roster_text(raid_id: int) -> Tuple[str, int]:
     roles = get_roles(raid_id)
     signups = get_signups(raid_id)
@@ -268,25 +342,37 @@ async def handle_signup(interaction: discord.Interaction, raid_id: int, role_nam
         await interaction.response.send_message("Такой роли нет в этом событии.", ephemeral=True)
         return
 
-    _, total = build_roster_text(raid_id)
-    if total >= raid.max_participants:
+    current_signup = get_user_signup(raid_id, interaction.user.id)
+    signups = get_signups(raid_id)
+    signups_without_user = [row for row in signups if row["user_id"] != interaction.user.id]
+
+    total_after = len(signups_without_user) + 1
+    if total_after > raid.max_participants:
         await interaction.response.send_message("Лимит участников достигнут.", ephemeral=True)
         return
 
-    by_role_count = len([1 for _, rname, _ in get_signups(raid_id) if rname == role_name])
-    if by_role_count >= roles[role_name]:
+    role_after = len([1 for row in signups_without_user if row["role_name"] == role_name]) + 1
+    if role_after > roles[role_name]:
         await interaction.response.send_message("Лимит по этой роли достигнут.", ephemeral=True)
         return
 
     with with_conn() as conn:
-        try:
+        if current_signup:
             conn.execute(
-                "INSERT OR REPLACE INTO raid_signups (raid_id, user_id, role_name, created_at) VALUES (?, ?, ?, ?)",
-                (raid_id, interaction.user.id, role_name, int(datetime.now(tz=timezone.utc).timestamp())),
+                "UPDATE raid_signups SET role_name = ? WHERE raid_id = ? AND user_id = ?",
+                (role_name, raid_id, interaction.user.id),
             )
-            conn.commit()
-        except sqlite3.IntegrityError:
-            pass
+        else:
+            conn.execute(
+                "INSERT INTO raid_signups (raid_id, user_id, role_name, created_at) VALUES (?, ?, ?, ?)",
+                (
+                    raid_id,
+                    interaction.user.id,
+                    role_name,
+                    int(datetime.now(tz=timezone.utc).timestamp()),
+                ),
+            )
+        conn.commit()
 
     # Update message embed if present
     await refresh_message(interaction.client, raid)
@@ -452,9 +538,18 @@ async def raid_edit(
             )
             conn.commit()
 
+    removed_signups = enforce_signup_limits(raid_id)
+
     raid = await fetch_raid(raid_id)
-    await refresh_message(interaction.client, raid)  # type: ignore[arg-type]
-    await interaction.response.send_message("Событие обновлено.", ephemeral=True)
+    if raid:
+        await refresh_message(interaction.client, raid)  # type: ignore[arg-type]
+
+    if removed_signups:
+        removed_text = ", ".join(f"<@{uid}> ({role})" for uid, role in removed_signups)
+        message = "Событие обновлено. Сняты из-за новых лимитов: " + removed_text
+    else:
+        message = "Событие обновлено."
+    await interaction.response.send_message(message, ephemeral=True)
 
 
 @group.command(name="delete", description="Удалить событие")
@@ -583,6 +678,88 @@ def _selftest() -> None:
         created_at=1,
     )
     assert raid.starts_dt is None
+
+    # Integration scenarios with temporary DB
+    tmp = tempfile.NamedTemporaryFile(delete=False)
+    tmp.close()
+    global DB_PATH
+    old_db_path = DB_PATH
+    DB_PATH = tmp.name
+    try:
+        init_db()
+
+        now_ts = int(datetime.now(tz=timezone.utc).timestamp())
+        with with_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO raids (guild_id, channel_id, name, starts_at, comment, max_participants, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (1, 1, "Test raid", 0, "", 2, 10, now_ts),
+            )
+            raid_id = cur.lastrowid
+            cur.execute(
+                "INSERT INTO raid_roles (raid_id, role_name, capacity) VALUES (?, ?, ?)",
+                (raid_id, "tank", 2),
+            )
+            cur.execute(
+                "INSERT INTO raid_roles (raid_id, role_name, capacity) VALUES (?, ?, ?)",
+                (raid_id, "healer", 2),
+            )
+            # Initial signups: user 100 tank, user 200 healer
+            cur.execute(
+                "INSERT INTO raid_signups (raid_id, user_id, role_name, created_at) VALUES (?, ?, ?, ?)",
+                (raid_id, 100, "tank", now_ts),
+            )
+            cur.execute(
+                "INSERT INTO raid_signups (raid_id, user_id, role_name, created_at) VALUES (?, ?, ?, ?)",
+                (raid_id, 200, "healer", now_ts + 1),
+            )
+            conn.commit()
+
+        class DummyResponse:
+            def __init__(self):
+                self.messages: List[Optional[str]] = []
+
+            async def send_message(self, content=None, *, ephemeral=False, embed=None, view=None):
+                self.messages.append(content)
+
+        class DummyUser:
+            def __init__(self, user_id: int):
+                self.id = user_id
+                self.guild_permissions = type("Perms", (), {})()
+
+        class DummyInteraction:
+            def __init__(self, user_id: int):
+                self.user = DummyUser(user_id)
+                self.client = object()
+                self.response = DummyResponse()
+
+        async def run_async_tests() -> None:
+            # Switching role in a full raid should succeed if limits stay valid
+            interaction = DummyInteraction(100)
+            await handle_signup(interaction, raid_id, "healer")
+            assert any("Вы записались" in (msg or "") for msg in interaction.response.messages)
+            with with_conn() as conn:
+                row = conn.execute(
+                    "SELECT role_name FROM raid_signups WHERE raid_id = ? AND user_id = ?",
+                    (raid_id, 100),
+                ).fetchone()
+            assert row["role_name"] == "healer"
+
+            # Reducing max participants should drop the latest signup
+            edit_interaction = DummyInteraction(10)
+            await raid_edit.callback(edit_interaction, raid_id, max_participants=1)  # type: ignore[attr-defined]
+            assert any("Сняты" in (msg or "") for msg in edit_interaction.response.messages)
+            signups_after = get_signups(raid_id)
+            assert len(signups_after) == 1
+            assert signups_after[0]["user_id"] == 100
+
+        asyncio.run(run_async_tests())
+    finally:
+        DB_PATH = old_db_path
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
 
 
 # ===================== Entrypoint =====================
