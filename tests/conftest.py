@@ -6,13 +6,20 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
 
-import pytest
-
 import sys
+import warnings
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+warnings.filterwarnings(
+    "ignore",
+    message="'audioop' is deprecated and slated for removal in Python 3.13",
+    category=DeprecationWarning,
+)
 
 try:  # pragma: no cover - executed only when discord is unavailable
     import discord  # type: ignore
