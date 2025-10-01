@@ -64,6 +64,12 @@ PERMISSION_ERROR = (
     "Недостаточно прав: только создатель события или модератор с Manage Events."
 )
 
+ATTENDANCE_STATUS_LABELS = {
+    db.ATTENDANCE_STATUS_MAIN: "основной состав",
+    db.ATTENDANCE_STATUS_WAITLIST: "резерв",
+    db.ATTENDANCE_STATUS_REMOVED: "удалён",
+}
+
 
 @raid_group.command(name="create", description="Создать рейдовое событие")
 @app_commands.describe(
@@ -637,6 +643,67 @@ async def raid_view(interaction: discord.Interaction, raid_id: int) -> None:
     await interaction.response.send_message(
         embed=make_embed(raid, roles, signups, waitlist), view=SignupView(raid.id)
     )
+
+
+@raid_group.command(name="stats", description="Статистика посещаемости рейдов")
+@app_commands.describe(
+    limit="Количество записей (по умолчанию 10)",
+    member="Показать историю конкретного участника",
+)
+async def raid_stats(
+    interaction: discord.Interaction,
+    limit: app_commands.Range[int, 1, 25] = 10,
+    member: Optional[discord.Member] = None,
+) -> None:
+    if interaction.guild_id is None:
+        await interaction.response.send_message(
+            "Команда доступна только внутри сервера.", ephemeral=True
+        )
+        return
+    guild_id = int(interaction.guild_id)
+    if member is not None:
+        history = db.get_attendance_history(guild_id, member.id, int(limit))
+        if not history:
+            await interaction.response.send_message(
+                f"Для {member.mention} пока нет записей посещаемости.",
+                ephemeral=True,
+            )
+            return
+        lines: list[str] = []
+        for record in history:
+            moment = datetime.fromtimestamp(record.recorded_at, tz=timezone.utc)
+            when = discord.utils.format_dt(moment, style="f")
+            raid_name = record.raid_name or f"Рейд #{record.raid_id}"
+            status = ATTENDANCE_STATUS_LABELS.get(record.status, record.status)
+            lines.append(
+                f"{when} • {raid_name} — {status} ({record.role_name})"
+            )
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+        return
+
+    summaries = db.get_attendance_summary(guild_id)
+    if not summaries:
+        await interaction.response.send_message(
+            "Статистика пока пуста — запланируйте первый рейд!",
+            ephemeral=True,
+        )
+        return
+
+    top_summaries = summaries[: int(limit)]
+    lines = []
+    for index, summary in enumerate(top_summaries, start=1):
+        roles_text = ", ".join(
+            f"{role}:{count}" for role, count in summary.roles.items()
+        )
+        if not roles_text:
+            roles_text = "без указания роли"
+        lines.append(
+            f"{index}. <@{summary.user_id}> — {summary.total} рейдов ({roles_text})"
+        )
+    lines.append(
+        "Укажите параметр `member`, чтобы увидеть историю конкретного игрока."
+    )
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
 @raid_group.command(name="list", description="Список ближайших событий")

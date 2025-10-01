@@ -171,17 +171,28 @@ except ModuleNotFoundError:  # pragma: no cover - fallback stub for tests
     discord.Thread = Thread
     discord.HTTPException = HTTPException
     discord.NotFound = NotFound
+    utils_module = ModuleType("discord.utils")
+
+    def format_dt(value: Any, style: str = "f") -> str:  # pragma: no cover - stub helper
+        if hasattr(value, "timestamp"):
+            return f"<t:{int(value.timestamp())}:{style}>"
+        return str(value)
+
+    utils_module.format_dt = format_dt
+
     discord.ButtonStyle = ButtonStyle
     discord.SelectOption = SelectOption
     discord.ui = ui_module
     discord.app_commands = app_commands_module
     discord.ext = ext_module
+    discord.utils = utils_module
 
     sys.modules["discord"] = discord
     sys.modules["discord.ui"] = ui_module
     sys.modules["discord.app_commands"] = app_commands_module
     sys.modules["discord.ext"] = ext_module
     sys.modules["discord.ext.commands"] = ext_commands_module
+    sys.modules["discord.utils"] = utils_module
 
 import config
 import db

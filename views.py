@@ -94,7 +94,7 @@ async def handle_signup(interaction: discord.Interaction, raid_id: int, role_nam
 
     if wait_entry:
         if available_slot:
-            db.remove_waitlist_entry(raid_id, interaction.user.id)
+            db.remove_waitlist_entry(raid_id, interaction.user.id, suppress_log=True)
             db.add_signup(
                 raid_id,
                 interaction.user.id,

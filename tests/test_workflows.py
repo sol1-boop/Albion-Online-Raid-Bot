@@ -61,6 +61,42 @@ def test_enforce_limits_and_promotion() -> None:
     assert sorted(user.user_id for user in signups) == [200, 300]
 
 
+def test_attendance_history_and_summary() -> None:
+    now_ts = int(datetime.now(tz=timezone.utc).timestamp())
+    raid_id = db.create_raid(
+        guild_id=1,
+        channel_id=10,
+        name="Attendance Test",
+        starts_at=0,
+        comment="",
+        max_participants=2,
+        created_by=7,
+        roles={"tank": 1, "healer": 1, "dps": 1},
+    )
+    db.add_signup(raid_id, 10, "tank", now_ts)
+    db.add_signup(raid_id, 11, "healer", now_ts + 1)
+    db.add_signup(raid_id, 12, "dps", now_ts + 2)
+
+    db.enforce_signup_limits(raid_id)
+    db.remove_signup(raid_id, 10)
+    db.promote_waitlist(raid_id)
+
+    summaries = db.get_attendance_summary(1)
+    summary_map = {item.user_id: item for item in summaries}
+    assert 10 not in summary_map  # игрок удалён из состава
+    assert summary_map[11].total == 1
+    assert summary_map[12].roles == {"dps": 1}
+
+    history_promoted = db.get_attendance_history(1, 12, limit=5)
+    assert history_promoted
+    assert history_promoted[0].status == db.ATTENDANCE_STATUS_MAIN
+    assert history_promoted[0].raid_name == "Attendance Test"
+
+    history_removed = db.get_attendance_history(1, 10, limit=3)
+    assert history_removed
+    assert history_removed[0].status == db.ATTENDANCE_STATUS_REMOVED
+
+
 def test_schedule_generation_creates_raid(monkeypatch, stub_client, stub_channel) -> None:
     async def run_flow() -> None:
         template_id = db.save_template(
