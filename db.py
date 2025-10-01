@@ -1,14 +1,28 @@
 """Database access layer for the raid bot."""
 from __future__ import annotations
 
+from collections import Counter
 import sqlite3
 from datetime import datetime, timezone
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from config import DB_PATH
-from models import Raid, RaidSchedule, Reminder, RaidTemplate, Signup, WaitlistEntry
+from models import (
+    AttendanceRecord,
+    PlayerAttendanceSummary,
+    Raid,
+    RaidSchedule,
+    Reminder,
+    RaidTemplate,
+    Signup,
+    WaitlistEntry,
+)
 
 DEFAULT_REMINDER_OFFSETS = (3600, 900, 300)
+
+ATTENDANCE_STATUS_MAIN = "main"
+ATTENDANCE_STATUS_WAITLIST = "waitlist"
+ATTENDANCE_STATUS_REMOVED = "removed"
 
 
 def _encode_offsets(offsets: Sequence[int] | None) -> str:
@@ -43,6 +57,130 @@ def with_conn() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     return conn
 
+
+def _get_raid_guild_id(raid_id: int) -> Optional[int]:
+    with with_conn() as conn:
+        row = conn.execute("SELECT guild_id FROM raids WHERE id = ?", (raid_id,)).fetchone()
+    if not row:
+        return None
+    return int(row["guild_id"])
+
+
+def record_attendance(
+    raid_id: int,
+    user_id: int,
+    role_name: str,
+    status: str,
+    *,
+    guild_id: Optional[int] = None,
+    recorded_at: Optional[int] = None,
+) -> None:
+    guild = guild_id or _get_raid_guild_id(raid_id)
+    if guild is None:
+        return
+    timestamp = recorded_at or int(datetime.now(tz=timezone.utc).timestamp())
+    with with_conn() as conn:
+        last = conn.execute(
+            """
+            SELECT role_name, status
+            FROM raid_attendance_log
+            WHERE raid_id = ? AND user_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (raid_id, user_id),
+        ).fetchone()
+        if last and str(last["role_name"]) == role_name and str(last["status"]) == status:
+            return
+        conn.execute(
+            """
+            INSERT INTO raid_attendance_log (
+                guild_id,
+                raid_id,
+                user_id,
+                role_name,
+                status,
+                recorded_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (guild, raid_id, user_id, role_name, status, timestamp),
+        )
+        conn.commit()
+
+
+def _latest_attendance_records(guild_id: int) -> List[AttendanceRecord]:
+    with with_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT log.id,
+                   log.guild_id,
+                   log.raid_id,
+                   log.user_id,
+                   log.role_name,
+                   log.status,
+                   log.recorded_at
+            FROM raid_attendance_log AS log
+            JOIN (
+                SELECT raid_id, user_id, MAX(id) AS latest_id
+                FROM raid_attendance_log
+                WHERE guild_id = ?
+                GROUP BY raid_id, user_id
+            ) AS latest
+              ON log.raid_id = latest.raid_id
+             AND log.user_id = latest.user_id
+             AND log.id = latest.latest_id
+            WHERE log.guild_id = ?
+            """,
+            (guild_id, guild_id),
+        ).fetchall()
+    return [AttendanceRecord(**dict(row)) for row in rows]
+
+
+def get_attendance_history(
+    guild_id: int, user_id: int, limit: int = 20
+) -> List[AttendanceRecord]:
+    if limit <= 0:
+        return []
+    with with_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT log.id,
+                   log.guild_id,
+                   log.raid_id,
+                   log.user_id,
+                   log.role_name,
+                   log.status,
+                   log.recorded_at,
+                   raids.name AS raid_name
+            FROM raid_attendance_log AS log
+            LEFT JOIN raids ON raids.id = log.raid_id
+            WHERE log.guild_id = ? AND log.user_id = ?
+            ORDER BY log.id DESC
+            LIMIT ?
+            """,
+            (guild_id, user_id, int(limit)),
+        ).fetchall()
+    return [AttendanceRecord(**dict(row)) for row in rows]
+
+
+def get_attendance_summary(guild_id: int) -> List[PlayerAttendanceSummary]:
+    latest = _latest_attendance_records(guild_id)
+    totals: Dict[int, Counter[str]] = {}
+    for record in latest:
+        if record.status != ATTENDANCE_STATUS_MAIN:
+            continue
+        counter = totals.setdefault(record.user_id, Counter())
+        counter[record.role_name] += 1
+    summaries = [
+        PlayerAttendanceSummary(
+            user_id=user_id,
+            total=sum(counter.values()),
+            roles=dict(sorted(counter.items(), key=lambda item: (-item[1], item[0]))),
+        )
+        for user_id, counter in totals.items()
+    ]
+    summaries.sort(key=lambda item: (-item.total, item.user_id))
+    return summaries
 
 def init_db() -> None:
     with with_conn() as conn:
@@ -109,6 +247,32 @@ def init_db() -> None:
                 PRIMARY KEY (raid_id, offset),
                 FOREIGN KEY (raid_id) REFERENCES raids(id) ON DELETE CASCADE
             )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS raid_attendance_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                raid_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                role_name TEXT NOT NULL,
+                status TEXT NOT NULL,
+                recorded_at INTEGER NOT NULL,
+                FOREIGN KEY (raid_id) REFERENCES raids(id) ON DELETE CASCADE
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_attendance_guild_user
+                ON raid_attendance_log (guild_id, user_id, id DESC)
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_attendance_raid_user
+                ON raid_attendance_log (raid_id, user_id, id DESC)
             """
         )
         cur.execute(
@@ -251,6 +415,9 @@ def update_raid(
 
 
 def replace_roles(raid_id: int, roles: Dict[str, int]) -> None:
+    existing_signups = get_signups(raid_id)
+    existing_waitlist = get_waitlist(raid_id)
+    valid_roles = {str(name) for name in roles}
     with with_conn() as conn:
         conn.execute("DELETE FROM raid_roles WHERE raid_id = ?", (raid_id,))
         for role_name, capacity in roles.items():
@@ -271,6 +438,22 @@ def replace_roles(raid_id: int, roles: Dict[str, int]) -> None:
             (raid_id, raid_id),
         )
         conn.commit()
+    for signup in existing_signups:
+        if signup.role_name not in valid_roles:
+            record_attendance(
+                raid_id,
+                signup.user_id,
+                signup.role_name,
+                ATTENDANCE_STATUS_REMOVED,
+            )
+    for entry in existing_waitlist:
+        if entry.role_name not in valid_roles:
+            record_attendance(
+                raid_id,
+                entry.user_id,
+                entry.role_name,
+                ATTENDANCE_STATUS_REMOVED,
+            )
 
 
 def delete_raid(raid_id: int) -> None:
@@ -420,6 +603,13 @@ def add_signup(raid_id: int, user_id: int, role_name: str, created_at: Optional[
             (raid_id, user_id, role_name, created_ts),
         )
         conn.commit()
+    record_attendance(
+        raid_id,
+        user_id,
+        role_name,
+        ATTENDANCE_STATUS_MAIN,
+        recorded_at=created_ts,
+    )
 
 
 def add_waitlist_entry(
@@ -434,6 +624,13 @@ def add_waitlist_entry(
                 (role_name, min(existing.created_at, created_ts), raid_id, user_id),
             )
             conn.commit()
+        record_attendance(
+            raid_id,
+            user_id,
+            role_name,
+            ATTENDANCE_STATUS_WAITLIST,
+            recorded_at=min(existing.created_at, created_ts),
+        )
     else:
         with with_conn() as conn:
             conn.execute(
@@ -444,6 +641,13 @@ def add_waitlist_entry(
                 (raid_id, user_id, role_name, created_ts),
             )
             conn.commit()
+        record_attendance(
+            raid_id,
+            user_id,
+            role_name,
+            ATTENDANCE_STATUS_WAITLIST,
+            recorded_at=created_ts,
+        )
 
 
 def update_waitlist_role(raid_id: int, user_id: int, role_name: str) -> None:
@@ -453,6 +657,12 @@ def update_waitlist_role(raid_id: int, user_id: int, role_name: str) -> None:
             (role_name, raid_id, user_id),
         )
         conn.commit()
+    record_attendance(
+        raid_id,
+        user_id,
+        role_name,
+        ATTENDANCE_STATUS_WAITLIST,
+    )
 
 
 def update_signup_role(raid_id: int, user_id: int, role_name: str) -> None:
@@ -462,24 +672,60 @@ def update_signup_role(raid_id: int, user_id: int, role_name: str) -> None:
             (role_name, raid_id, user_id),
         )
         conn.commit()
+    record_attendance(
+        raid_id,
+        user_id,
+        role_name,
+        ATTENDANCE_STATUS_MAIN,
+    )
 
 
 def remove_signup(raid_id: int, user_id: int) -> None:
+    role_name: Optional[str] = None
     with with_conn() as conn:
+        row = conn.execute(
+            "SELECT role_name FROM raid_signups WHERE raid_id = ? AND user_id = ?",
+            (raid_id, user_id),
+        ).fetchone()
+        if row:
+            role_name = str(row["role_name"])
         conn.execute(
             "DELETE FROM raid_signups WHERE raid_id = ? AND user_id = ?",
             (raid_id, user_id),
         )
         conn.commit()
+    if role_name:
+        record_attendance(
+            raid_id,
+            user_id,
+            role_name,
+            ATTENDANCE_STATUS_REMOVED,
+        )
 
 
-def remove_waitlist_entry(raid_id: int, user_id: int) -> None:
+def remove_waitlist_entry(
+    raid_id: int, user_id: int, *, suppress_log: bool = False
+) -> None:
+    role_name: Optional[str] = None
     with with_conn() as conn:
+        row = conn.execute(
+            "SELECT role_name FROM raid_waitlist WHERE raid_id = ? AND user_id = ?",
+            (raid_id, user_id),
+        ).fetchone()
+        if row:
+            role_name = str(row["role_name"])
         conn.execute(
             "DELETE FROM raid_waitlist WHERE raid_id = ? AND user_id = ?",
             (raid_id, user_id),
         )
         conn.commit()
+    if not suppress_log and role_name:
+        record_attendance(
+            raid_id,
+            user_id,
+            role_name,
+            ATTENDANCE_STATUS_REMOVED,
+        )
 
 
 def enforce_signup_limits(raid_id: int) -> Dict[str, List[Tuple[int, str]]]:
@@ -534,6 +780,14 @@ def enforce_signup_limits(raid_id: int) -> Dict[str, List[Tuple[int, str]]]:
         else:
             to_remove.append(signup)
 
+    for signup in to_remove:
+        record_attendance(
+            raid_id,
+            signup.user_id,
+            signup.role_name,
+            ATTENDANCE_STATUS_REMOVED,
+        )
+
     return {
         "waitlisted": [(signup.user_id, signup.role_name) for signup in to_waitlist if signup.role_name in roles],
         "removed": [(signup.user_id, signup.role_name) for signup in to_remove if signup.role_name not in roles],
@@ -571,7 +825,7 @@ def promote_waitlist(raid_id: int) -> List[Tuple[int, str]]:
             break
         if counts[entry.role_name] >= roles[entry.role_name]:
             continue
-        remove_waitlist_entry(raid_id, entry.user_id)
+        remove_waitlist_entry(raid_id, entry.user_id, suppress_log=True)
         add_signup(raid_id, entry.user_id, entry.role_name, entry.created_at)
         counts[entry.role_name] += 1
         total += 1
@@ -926,6 +1180,9 @@ def list_due_schedules(now_ts: int) -> List[RaidSchedule]:
 
 
 __all__ = [
+    "ATTENDANCE_STATUS_MAIN",
+    "ATTENDANCE_STATUS_REMOVED",
+    "ATTENDANCE_STATUS_WAITLIST",
     "DEFAULT_REMINDER_OFFSETS",
     "add_signup",
     "add_waitlist_entry",
@@ -940,6 +1197,8 @@ __all__ = [
     "fetch_schedule",
     "fetch_template",
     "fetch_template_by_id",
+    "get_attendance_history",
+    "get_attendance_summary",
     "get_raid_reminder_offsets",
     "get_roles",
     "get_signups",
@@ -956,12 +1215,13 @@ __all__ = [
     "list_upcoming_raids",
     "mark_reminder_sent",
     "promote_waitlist",
+    "record_attendance",
     "remove_signup",
     "remove_waitlist_entry",
     "replace_roles",
     "reset_raid_reminders",
-    "set_raid_reminder_offsets",
     "save_template",
+    "set_raid_reminder_offsets",
     "update_message_id",
     "update_raid",
     "update_schedule_next_run",

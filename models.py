@@ -62,6 +62,25 @@ class Reminder:
 
 
 @dataclass(slots=True)
+class AttendanceRecord:
+    id: int
+    guild_id: int
+    raid_id: int
+    user_id: int
+    role_name: str
+    status: str
+    recorded_at: int
+    raid_name: Optional[str] = None
+
+
+@dataclass(slots=True)
+class PlayerAttendanceSummary:
+    user_id: int
+    total: int
+    roles: Dict[str, int]
+
+
+@dataclass(slots=True)
 class RaidSchedule:
     id: int
     guild_id: int
@@ -121,4 +140,6 @@ __all__ = [
     "RaidTemplate",
     "Signup",
     "WaitlistEntry",
+    "AttendanceRecord",
+    "PlayerAttendanceSummary",
 ]
