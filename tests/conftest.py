@@ -81,6 +81,9 @@ except ModuleNotFoundError:  # pragma: no cover - fallback stub for tests
     class ButtonStyle:
         secondary = 1
 
+    class TextStyle:
+        paragraph = 1
+
     class SelectOption:
         def __init__(self, label: str | None = None, description: str | None = None) -> None:
             self.label = label
@@ -99,6 +102,8 @@ except ModuleNotFoundError:  # pragma: no cover - fallback stub for tests
     class Select:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             self.values: list[str] = []
+            self.options = kwargs.get("options", [])
+            self.disabled = kwargs.get("disabled", False)
 
         async def callback(self, interaction: Interaction) -> None:
             return None
@@ -110,9 +115,36 @@ except ModuleNotFoundError:  # pragma: no cover - fallback stub for tests
         async def callback(self, interaction: Interaction) -> None:
             return None
 
+    class Modal:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.children: list[Any] = []
+
+        async def on_submit(self, interaction: Interaction) -> None:
+            return None
+
+    class TextInput:
+        def __init__(
+            self,
+            *,
+            label: str = "",
+            default: str | None = None,
+            required: bool = True,
+            style: Any | None = None,
+            placeholder: str | None = None,
+            max_length: int | None = None,
+        ) -> None:
+            self.label = label
+            self.value = default or ""
+            self.required = required
+            self.style = style
+            self.placeholder = placeholder
+            self.max_length = max_length
+
     ui_module.View = View
     ui_module.Select = Select
     ui_module.Button = Button
+    ui_module.Modal = Modal
+    ui_module.TextInput = TextInput
 
     app_commands_module = ModuleType("discord.app_commands")
 
@@ -188,6 +220,7 @@ except ModuleNotFoundError:  # pragma: no cover - fallback stub for tests
     utils_module.format_dt = format_dt
 
     discord.ButtonStyle = ButtonStyle
+    discord.TextStyle = TextStyle
     discord.SelectOption = SelectOption
     discord.ui = ui_module
     discord.app_commands = app_commands_module

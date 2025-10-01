@@ -2,12 +2,19 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import discord
 
 import db
+from config import TIME_FMT
 from models import Raid
+from template_actions import (
+    create_or_update_template,
+    delete_template,
+    instantiate_template,
+    list_templates_description,
+)
 from utils import make_embed
 
 
@@ -196,10 +203,228 @@ async def announce_promotions(
         pass
 
 
+class TemplateManagementView(discord.ui.View):
+    def __init__(self, *, guild_id: int, channel_id: int):
+        super().__init__(timeout=600)
+        self.guild_id = guild_id
+        self.channel_id = channel_id
+        self.selected_template: Optional[str] = None
+        self.template_select = TemplateChoiceSelect(self)
+        self.action_select = TemplateActionSelect(self)
+        self.add_item(self.template_select)
+        self.add_item(self.action_select)
+
+    def build_options(self) -> List[discord.SelectOption]:
+        templates = db.list_templates(self.guild_id)
+        return [
+            discord.SelectOption(
+                label=tpl.name,
+                value=tpl.name,
+                description=f"Лимит {tpl.max_participants}"
+            )
+            for tpl in templates
+        ]
+
+
+class TemplateChoiceSelect(discord.ui.Select):
+    def __init__(self, management_view: TemplateManagementView):
+        self.management_view = management_view
+        options = management_view.build_options()
+        disabled = False
+        if not options:
+            options = [
+                discord.SelectOption(
+                    label="Нет шаблонов",
+                    value="__empty__",
+                    description="Создайте шаблон через меню действий",
+                )
+            ]
+            disabled = True
+        super().__init__(
+            placeholder="Выберите шаблон",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id=f"template:{management_view.guild_id}:select",
+            disabled=disabled,
+        )
+
+    def reload_options(self) -> None:
+        options = self.management_view.build_options()
+        if options:
+            self.options = options
+            self.disabled = False
+        else:
+            self.options = [
+                discord.SelectOption(
+                    label="Нет шаблонов",
+                    value="__empty__",
+                    description="Создайте шаблон через меню действий",
+                )
+            ]
+            self.disabled = True
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # pragma: no cover - UI callback
+        if self.disabled:
+            await interaction.response.send_message(
+                "Сначала создайте шаблон через меню действий.", ephemeral=True
+            )
+            return
+        value = self.values[0]
+        self.management_view.selected_template = value
+        await interaction.response.send_message(
+            f"Шаблон **{value}** выбран. Теперь выберите действие.", ephemeral=True
+        )
+
+
+class TemplateActionSelect(discord.ui.Select):
+    ACTION_CREATE = "create"
+    ACTION_USE = "use"
+    ACTION_DELETE = "delete"
+    ACTION_LIST = "list"
+
+    def __init__(self, management_view: TemplateManagementView):
+        self.management_view = management_view
+        super().__init__(
+            placeholder="Выберите действие",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(label="Создать шаблон", value=self.ACTION_CREATE),
+                discord.SelectOption(label="Использовать шаблон", value=self.ACTION_USE),
+                discord.SelectOption(label="Удалить шаблон", value=self.ACTION_DELETE),
+                discord.SelectOption(label="Показать список", value=self.ACTION_LIST),
+            ],
+            custom_id=f"template:{management_view.guild_id}:action",
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # pragma: no cover - UI callback
+        action = self.values[0]
+        if action == self.ACTION_LIST:
+            description, _ = list_templates_description(self.management_view.guild_id)
+            await interaction.response.send_message(description, ephemeral=True)
+            return
+        if action == self.ACTION_CREATE:
+            await interaction.response.send_modal(TemplateCreateModal(self.management_view))
+            return
+        template_name = self.management_view.selected_template
+        if not template_name:
+            await interaction.response.send_message(
+                "Сначала выберите шаблон в выпадающем списке.", ephemeral=True
+            )
+            return
+        if action == self.ACTION_USE:
+            await interaction.response.send_modal(
+                TemplateUseModal(self.management_view, template_name)
+            )
+            return
+        if action == self.ACTION_DELETE:
+            await interaction.response.defer(ephemeral=True)
+            try:
+                message = delete_template(self.management_view.guild_id, template_name)
+            except ValueError as exc:
+                await interaction.followup.send(f"Ошибка: {exc}", ephemeral=True)
+                return
+            await interaction.followup.send(message, ephemeral=True)
+            self.management_view.selected_template = None
+            self.management_view.template_select.reload_options()
+            await interaction.message.edit(view=self.management_view)
+
+
+class TemplateCreateModal(discord.ui.Modal):
+    def __init__(self, management_view: TemplateManagementView):
+        super().__init__(title="Создать шаблон")
+        self.management_view = management_view
+        self.template_name = discord.ui.TextInput(label="Название шаблона", max_length=100)
+        self.max_participants = discord.ui.TextInput(
+            label="Лимит участников", placeholder="Например 20"
+        )
+        self.roles = discord.ui.TextInput(
+            label="Роли и лимиты", placeholder="tank:2, healer:3"
+        )
+        self.comment = discord.ui.TextInput(
+            label="Комментарий", style=discord.TextStyle.paragraph, required=False
+        )
+        self.reminders = discord.ui.TextInput(
+            label="Напоминания", required=False, placeholder="120,30m,10m"
+        )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:  # pragma: no cover - UI callback
+        try:
+            message = create_or_update_template(
+                guild_id=self.management_view.guild_id,
+                template_name=self.template_name.value,
+                max_participants=self.max_participants.value,
+                roles=self.roles.value,
+                comment=self.comment.value,
+                reminders=self.reminders.value,
+            )
+        except Exception as exc:  # pragma: no cover - handled via Discord UI
+            await interaction.response.send_message(f"Ошибка: {exc}", ephemeral=True)
+            return
+        description, _ = list_templates_description(self.management_view.guild_id)
+        view = TemplateManagementView(
+            guild_id=self.management_view.guild_id,
+            channel_id=self.management_view.channel_id,
+        )
+        await interaction.response.send_message(
+            f"{message}\n\n{description}", ephemeral=True, view=view
+        )
+
+
+class TemplateUseModal(discord.ui.Modal):
+    def __init__(self, management_view: TemplateManagementView, template_name: str):
+        super().__init__(title=f"Рейд по шаблону {template_name}")
+        self.management_view = management_view
+        self.template_name = template_name
+        self.event_name = discord.ui.TextInput(
+            label="Название рейда", default=template_name, max_length=100
+        )
+        self.starts_at = discord.ui.TextInput(
+            label="Время старта", required=False, placeholder=TIME_FMT
+        )
+        self.max_participants = discord.ui.TextInput(
+            label="Лимит участников", required=False
+        )
+        self.comment = discord.ui.TextInput(
+            label="Комментарий", style=discord.TextStyle.paragraph, required=False
+        )
+        self.reminders = discord.ui.TextInput(
+            label="Напоминания", required=False, placeholder="120,30m,10m"
+        )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:  # pragma: no cover - UI callback
+        starts_at_value = self.starts_at.value.strip() or None
+        max_participants_value = self.max_participants.value.strip() or None
+        comment_value = self.comment.value if self.comment.value.strip() else None
+        reminders_value = self.reminders.value.strip() or None
+        try:
+            raid, roles_data, signups, waitlist = instantiate_template(
+                guild_id=self.management_view.guild_id,
+                channel_id=self.management_view.channel_id,
+                author_id=interaction.user.id,
+                template_name=self.template_name,
+                event_name=self.event_name.value,
+                starts_at=starts_at_value,
+                max_participants=max_participants_value,
+                comment=comment_value,
+                reminders=reminders_value,
+            )
+        except Exception as exc:  # pragma: no cover - handled via Discord UI
+            await interaction.response.send_message(f"Ошибка: {exc}", ephemeral=True)
+            return
+        embed = make_embed(raid, roles_data, signups, waitlist)
+        view = SignupView(raid.id)
+        await interaction.response.send_message(embed=embed, view=view)
+        msg = await interaction.original_response()
+        db.update_message_id(raid.id, msg.id)
+
+
 __all__ = [
     "LeaveButton",
     "RoleSelect",
     "SignupView",
+    "TemplateManagementView",
     "announce_promotions",
     "handle_signup",
     "handle_unsubscribe",
