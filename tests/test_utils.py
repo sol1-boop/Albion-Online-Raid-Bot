@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 
 import pytest
 
-import config
 import db
 import utils
 from models import Raid
@@ -64,12 +64,8 @@ def test_raid_starts_dt_property() -> None:
     assert raid.starts_dt is None
 
 
-def test_signup_flow_and_limits(monkeypatch, tmp_path) -> None:
-    tmp_db = tmp_path / "raids.db"
-    old_path = config.DB_PATH
-    config.DB_PATH = str(tmp_db)
-    try:
-        db.init_db()
+def test_signup_flow_and_limits(monkeypatch) -> None:
+    async def run_flow() -> None:
         now_ts = int(datetime.now(tz=timezone.utc).timestamp())
         raid_id = db.create_raid(
             guild_id=1,
@@ -84,14 +80,20 @@ def test_signup_flow_and_limits(monkeypatch, tmp_path) -> None:
         db.add_signup(raid_id, 100, "tank", now_ts)
         db.add_signup(raid_id, 200, "healer", now_ts + 1)
 
-        async def dummy_refresh(client, raid):
-            return None
-
-        pytest.importorskip("discord")
-
         import views
 
+        async def dummy_refresh(*_: object, **__: object) -> None:
+            return None
+
+        async def dummy_sync(*_: object, **__: object) -> list[tuple[int, str]]:
+            return []
+
+        async def dummy_announce(*_: object, **__: object) -> None:
+            return None
+
         monkeypatch.setattr(views, "refresh_message", dummy_refresh)
+        monkeypatch.setattr(views, "sync_roster", dummy_sync)
+        monkeypatch.setattr(views, "announce_promotions", dummy_announce)
 
         class DummyResponse:
             def __init__(self) -> None:
@@ -118,31 +120,27 @@ def test_signup_flow_and_limits(monkeypatch, tmp_path) -> None:
                 self.user = DummyUser(user_id)
                 self.response = DummyResponse()
                 self.client = DummyClient()
+                self.guild_id = 1
+                self.channel_id = 1
 
-        async def run_flow() -> None:
-            interaction = DummyInteraction(100)
-            await views.handle_signup(interaction, raid_id, "healer")
-            assert any("Вы записались" in (msg or "") for msg in interaction.response.messages)
-            signup = db.get_user_signup(raid_id, 100)
-            assert signup and signup.role_name == "healer"
+        interaction = DummyInteraction(100)
+        await views.handle_signup(interaction, raid_id, "healer")
+        assert any("Вы записались" in (msg or "") for msg in interaction.response.messages)
+        signup = db.get_user_signup(raid_id, 100)
+        assert signup and signup.role_name == "healer"
 
-            edit_interaction = DummyInteraction(10)
+        from commands import raid_edit
 
-            from commands import raid_edit
+        edit_interaction = DummyInteraction(10)
+        await raid_edit.callback(edit_interaction, raid_id, max_participants=1)
+        assert any(
+            "Перемещены" in (msg or "") or "Событие обновлено" in (msg or "")
+            for msg in edit_interaction.response.messages
+        )
+        signups_after = db.get_signups(raid_id)
+        assert len(signups_after) == 1
+        assert signups_after[0].user_id == 100
+        waitlist = db.get_waitlist(raid_id)
+        assert waitlist and waitlist[0].user_id == 200
 
-            await raid_edit.callback(edit_interaction, raid_id, max_participants=1)
-            assert any(
-                "Перемещены" in (msg or "") or "Событие обновлено" in (msg or "")
-                for msg in edit_interaction.response.messages
-            )
-            signups_after = db.get_signups(raid_id)
-            assert len(signups_after) == 1
-            assert signups_after[0].user_id == 100
-            waitlist = db.get_waitlist(raid_id)
-            assert waitlist and waitlist[0].user_id == 200
-
-        import asyncio
-
-        asyncio.run(run_flow())
-    finally:
-        config.DB_PATH = old_path
+    asyncio.run(run_flow())
