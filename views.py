@@ -86,7 +86,7 @@ async def handle_signup(interaction: discord.Interaction, raid_id: int, role_nam
         promotions = await sync_roster(interaction.client, raid)
         await announce_promotions(interaction.client, raid, promotions)
         await interaction.response.send_message(
-            f"Ваша роль обновлена на **{role_name}**.", ephemeral=True
+            f"Вы записались как **{role_name}** (обновлено).", ephemeral=True
         )
         return
 
