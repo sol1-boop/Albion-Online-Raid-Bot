@@ -6,6 +6,12 @@ from datetime import datetime, timezone
 from typing import Dict, Optional
 
 
+def _parse_offsets(raw: str) -> tuple[int, ...]:
+    if not raw:
+        return ()
+    return tuple(int(part) for part in raw.split(",") if part)
+
+
 @dataclass(slots=True)
 class WaitlistEntry:
     raid_id: int
@@ -26,12 +32,17 @@ class Raid:
     max_participants: int
     created_by: int
     created_at: int
+    reminder_offsets: str
 
     @property
     def starts_dt(self) -> Optional[datetime]:
         if not self.starts_at:
             return None
         return datetime.fromtimestamp(self.starts_at, tz=timezone.utc)
+
+    @property
+    def reminder_offsets_tuple(self) -> tuple[int, ...]:
+        return _parse_offsets(self.reminder_offsets)
 
 
 @dataclass(slots=True)
@@ -51,13 +62,27 @@ class Reminder:
 
 
 @dataclass(slots=True)
-class RaidTemplate:
+class RaidSchedule:
     id: int
     guild_id: int
-    name: str
+    channel_id: int
+    template_id: Optional[int]
+    name_pattern: str
+    comment: str
     max_participants: int
     roles_json: str
-    comment: str
+    weekday: int
+    time_of_day: str
+    interval_days: int
+    lead_time_hours: int
+    reminder_offsets: str
+    next_run_at: int
+    generate_at: int
+    created_by: int
+
+    @property
+    def reminder_offsets_tuple(self) -> tuple[int, ...]:
+        return _parse_offsets(self.reminder_offsets)
 
     @property
     def roles(self) -> Dict[str, int]:
@@ -67,4 +92,33 @@ class RaidTemplate:
         return {str(k): int(v) for k, v in data.items()}
 
 
-__all__ = ["Raid", "Reminder", "RaidTemplate", "Signup", "WaitlistEntry"]
+@dataclass(slots=True)
+class RaidTemplate:
+    id: int
+    guild_id: int
+    name: str
+    max_participants: int
+    roles_json: str
+    comment: str
+    reminder_offsets: str
+
+    @property
+    def roles(self) -> Dict[str, int]:
+        import json
+
+        data = json.loads(self.roles_json) if self.roles_json else {}
+        return {str(k): int(v) for k, v in data.items()}
+
+    @property
+    def reminder_offsets_tuple(self) -> tuple[int, ...]:
+        return _parse_offsets(self.reminder_offsets)
+
+
+__all__ = [
+    "Raid",
+    "RaidSchedule",
+    "Reminder",
+    "RaidTemplate",
+    "Signup",
+    "WaitlistEntry",
+]

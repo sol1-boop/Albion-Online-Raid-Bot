@@ -1,7 +1,7 @@
 """Business logic helpers for the raid bot."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Mapping, Sequence, Tuple
 
 from config import TIME_FMT
@@ -39,6 +39,75 @@ def parse_time_local(value: str) -> datetime:
     naive = datetime.strptime(value, TIME_FMT)
     local_ts = naive.timestamp()
     return datetime.fromtimestamp(local_ts, tz=timezone.utc)
+
+
+def parse_time_of_day(value: str) -> Tuple[int, int]:
+    try:
+        hour_str, minute_str = value.split(":", 1)
+    except ValueError as exc:
+        raise ValueError("Время должно быть в формате ЧЧ:ММ") from exc
+    try:
+        hour = int(hour_str)
+        minute = int(minute_str)
+    except ValueError as exc:
+        raise ValueError("Часы и минуты должны быть числами") from exc
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError("Часы 0-23, минуты 0-59")
+    return hour, minute
+
+
+def compute_next_occurrence(
+    weekday: int, hour: int, minute: int, *, now: datetime | None = None
+) -> datetime:
+    if not (0 <= weekday <= 6):
+        raise ValueError("День недели должен быть от 0 до 6")
+    base = now or datetime.now(tz=timezone.utc)
+    local_now = base.astimezone()
+    days_ahead = (weekday - local_now.weekday()) % 7
+    candidate_date = (local_now + timedelta(days=days_ahead)).date()
+    candidate = datetime(
+        candidate_date.year,
+        candidate_date.month,
+        candidate_date.day,
+        hour,
+        minute,
+        tzinfo=local_now.tzinfo,
+    )
+    if candidate <= local_now:
+        candidate += timedelta(days=7)
+    return candidate.astimezone(timezone.utc)
+
+
+def parse_reminder_offsets(value: str | None) -> Tuple[int, ...]:
+    if not value:
+        return ()
+    parts: list[int] = []
+    for chunk in value.split(","):
+        raw = chunk.strip().lower()
+        if not raw:
+            continue
+        multiplier = 60
+        if raw.endswith("h"):
+            multiplier = 3600
+            raw = raw[:-1]
+        elif raw.endswith("m"):
+            multiplier = 60
+            raw = raw[:-1]
+        elif raw.endswith("d"):
+            multiplier = 86400
+            raw = raw[:-1]
+        try:
+            amount = int(raw)
+        except ValueError as exc:
+            raise ValueError(
+                "Интервалы напоминаний указываются числами (например 60, 30m, 2h)"
+            ) from exc
+        if amount <= 0:
+            raise ValueError("Интервалы должны быть положительными")
+        parts.append(amount * multiplier)
+    if not parts:
+        return ()
+    return tuple(parts)
 
 
 def ensure_permissions(interaction: "discord.Interaction", raid: Raid) -> bool:
@@ -120,8 +189,11 @@ def make_embed(
 __all__ = [
     "build_waitlist_text",
     "build_roster_text",
+    "compute_next_occurrence",
     "ensure_permissions",
     "make_embed",
+    "parse_reminder_offsets",
     "parse_roles",
     "parse_time_local",
+    "parse_time_of_day",
 ]
