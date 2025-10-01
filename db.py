@@ -6,9 +6,36 @@ from datetime import datetime, timezone
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from config import DB_PATH
-from models import Raid, Reminder, RaidTemplate, Signup, WaitlistEntry
+from models import Raid, RaidSchedule, Reminder, RaidTemplate, Signup, WaitlistEntry
 
 DEFAULT_REMINDER_OFFSETS = (3600, 900, 300)
+
+
+def _encode_offsets(offsets: Sequence[int] | None) -> str:
+    if not offsets:
+        return ""
+    cleaned: list[str] = []
+    for value in offsets:
+        ivalue = int(value)
+        if ivalue <= 0:
+            continue
+        cleaned.append(str(ivalue))
+    return ",".join(cleaned)
+
+
+def _decode_offsets(raw: Optional[str]) -> Tuple[int, ...]:
+    if not raw:
+        return ()
+    parts = []
+    for chunk in raw.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        try:
+            parts.append(int(chunk))
+        except ValueError:
+            continue
+    return tuple(parts)
 
 
 def with_conn() -> sqlite3.Connection:
@@ -32,7 +59,8 @@ def init_db() -> None:
                 comment TEXT,
                 max_participants INTEGER NOT NULL,
                 created_by INTEGER NOT NULL,
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                reminder_offsets TEXT NOT NULL DEFAULT ''
             )
             """
         )
@@ -92,10 +120,46 @@ def init_db() -> None:
                 max_participants INTEGER NOT NULL,
                 roles_json TEXT NOT NULL,
                 comment TEXT NOT NULL DEFAULT '',
+                reminder_offsets TEXT NOT NULL DEFAULT '',
                 UNIQUE (guild_id, name)
             )
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS raid_schedules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                template_id INTEGER,
+                name_pattern TEXT NOT NULL,
+                comment TEXT NOT NULL DEFAULT '',
+                max_participants INTEGER NOT NULL,
+                roles_json TEXT NOT NULL,
+                weekday INTEGER NOT NULL,
+                time_of_day TEXT NOT NULL,
+                interval_days INTEGER NOT NULL,
+                lead_time_hours INTEGER NOT NULL,
+                reminder_offsets TEXT NOT NULL DEFAULT '',
+                next_run_at INTEGER NOT NULL,
+                generate_at INTEGER NOT NULL,
+                created_by INTEGER NOT NULL,
+                FOREIGN KEY (template_id) REFERENCES raid_templates(id) ON DELETE SET NULL
+            )
+            """
+        )
+        try:
+            cur.execute(
+                "ALTER TABLE raids ADD COLUMN reminder_offsets TEXT NOT NULL DEFAULT ''"
+            )
+        except sqlite3.OperationalError:
+            pass
+        try:
+            cur.execute(
+                "ALTER TABLE raid_templates ADD COLUMN reminder_offsets TEXT NOT NULL DEFAULT ''"
+            )
+        except sqlite3.OperationalError:
+            pass
         conn.commit()
 
 
@@ -109,7 +173,13 @@ def create_raid(
     max_participants: int,
     created_by: int,
     roles: Dict[str, int],
+    reminder_offsets: Optional[Sequence[int]] = None,
 ) -> int:
+    offsets = (
+        tuple(reminder_offsets)
+        if reminder_offsets is not None
+        else tuple(DEFAULT_REMINDER_OFFSETS)
+    )
     with with_conn() as conn:
         cur = conn.cursor()
         cur.execute(
@@ -122,8 +192,9 @@ def create_raid(
                 comment,
                 max_participants,
                 created_by,
-                created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                created_at,
+                reminder_offsets
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 guild_id,
@@ -134,6 +205,7 @@ def create_raid(
                 max_participants,
                 created_by,
                 int(datetime.now(tz=timezone.utc).timestamp()),
+                _encode_offsets(offsets),
             ),
         )
         raid_id = int(cur.lastrowid)
@@ -223,6 +295,25 @@ def fetch_raid(raid_id: int) -> Optional[Raid]:
     if not row:
         return None
     return Raid(**dict(row))
+
+
+def get_raid_reminder_offsets(raid_id: int) -> Tuple[int, ...]:
+    with with_conn() as conn:
+        row = conn.execute(
+            "SELECT reminder_offsets FROM raids WHERE id = ?", (raid_id,)
+        ).fetchone()
+    if not row:
+        return ()
+    return _decode_offsets(row["reminder_offsets"])
+
+
+def set_raid_reminder_offsets(raid_id: int, offsets: Sequence[int]) -> None:
+    with with_conn() as conn:
+        conn.execute(
+            "UPDATE raids SET reminder_offsets = ? WHERE id = ?",
+            (_encode_offsets(offsets), raid_id),
+        )
+        conn.commit()
 
 
 def get_roles(raid_id: int) -> Dict[str, int]:
@@ -506,7 +597,15 @@ def list_upcoming_raids(guild_id: int, now_ts: int, limit: int) -> Sequence[Raid
 
 
 def reset_raid_reminders(raid_id: int, starts_at: int, offsets: Sequence[int] | None = None) -> None:
-    offsets = tuple(offsets or DEFAULT_REMINDER_OFFSETS)
+    if offsets is None:
+        stored = get_raid_reminder_offsets(raid_id)
+        if stored:
+            offsets = stored
+        else:
+            offsets = DEFAULT_REMINDER_OFFSETS
+    else:
+        set_raid_reminder_offsets(raid_id, offsets)
+    offsets = tuple(int(value) for value in offsets)
     with with_conn() as conn:
         conn.execute("DELETE FROM raid_reminders WHERE raid_id = ?", (raid_id,))
         now_ts = int(datetime.now(tz=timezone.utc).timestamp())
@@ -591,21 +690,38 @@ def save_template(
     max_participants: int,
     roles: Dict[str, int],
     comment: str = "",
+    reminder_offsets: Sequence[int] | None = None,
 ) -> int:
     import json
 
     roles_json = json.dumps({str(k): int(v) for k, v in roles.items()})
+    reminder_value = _encode_offsets(reminder_offsets)
     with with_conn() as conn:
         conn.execute(
             """
-            INSERT INTO raid_templates (guild_id, name, max_participants, roles_json, comment)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO raid_templates (
+                guild_id,
+                name,
+                max_participants,
+                roles_json,
+                comment,
+                reminder_offsets
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(guild_id, name) DO UPDATE SET
                 max_participants = excluded.max_participants,
                 roles_json = excluded.roles_json,
-                comment = excluded.comment
+                comment = excluded.comment,
+                reminder_offsets = excluded.reminder_offsets
             """,
-            (guild_id, name, int(max_participants), roles_json, comment or ""),
+            (
+                guild_id,
+                name,
+                int(max_participants),
+                roles_json,
+                comment or "",
+                reminder_value,
+            ),
         )
         row = conn.execute(
             "SELECT id FROM raid_templates WHERE guild_id = ? AND name = ?",
@@ -631,7 +747,7 @@ def list_templates(guild_id: int) -> List[RaidTemplate]:
     with with_conn() as conn:
         rows = conn.execute(
             """
-            SELECT id, guild_id, name, max_participants, roles_json, comment
+            SELECT id, guild_id, name, max_participants, roles_json, comment, reminder_offsets
             FROM raid_templates
             WHERE guild_id = ?
             ORDER BY name
@@ -645,7 +761,7 @@ def fetch_template(guild_id: int, name: str) -> Optional[RaidTemplate]:
     with with_conn() as conn:
         row = conn.execute(
             """
-            SELECT id, guild_id, name, max_participants, roles_json, comment
+            SELECT id, guild_id, name, max_participants, roles_json, comment, reminder_offsets
             FROM raid_templates
             WHERE guild_id = ? AND name = ?
             """,
@@ -656,17 +772,175 @@ def fetch_template(guild_id: int, name: str) -> Optional[RaidTemplate]:
     return RaidTemplate(**dict(row))
 
 
+def fetch_template_by_id(template_id: int) -> Optional[RaidTemplate]:
+    with with_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT id, guild_id, name, max_participants, roles_json, comment, reminder_offsets
+            FROM raid_templates
+            WHERE id = ?
+            """,
+            (template_id,),
+        ).fetchone()
+    if not row:
+        return None
+    return RaidTemplate(**dict(row))
+
+
+def _row_to_schedule(row: sqlite3.Row) -> RaidSchedule:
+    return RaidSchedule(
+        id=int(row["id"]),
+        guild_id=int(row["guild_id"]),
+        channel_id=int(row["channel_id"]),
+        template_id=(int(row["template_id"]) if row["template_id"] is not None else None),
+        name_pattern=str(row["name_pattern"]),
+        comment=str(row["comment"]),
+        max_participants=int(row["max_participants"]),
+        roles_json=str(row["roles_json"]),
+        weekday=int(row["weekday"]),
+        time_of_day=str(row["time_of_day"]),
+        interval_days=int(row["interval_days"]),
+        lead_time_hours=int(row["lead_time_hours"]),
+        reminder_offsets=str(row["reminder_offsets"]),
+        next_run_at=int(row["next_run_at"]),
+        generate_at=int(row["generate_at"]),
+        created_by=int(row["created_by"]),
+    )
+
+
+def create_schedule(
+    *,
+    guild_id: int,
+    channel_id: int,
+    template_id: Optional[int],
+    name_pattern: str,
+    comment: str,
+    max_participants: int,
+    roles_json: str,
+    weekday: int,
+    time_of_day: str,
+    interval_days: int,
+    lead_time_hours: int,
+    reminder_offsets: Sequence[int] | None,
+    next_run_at: int,
+    created_by: int,
+) -> int:
+    reminder_value = _encode_offsets(reminder_offsets)
+    generate_at = max(next_run_at - int(lead_time_hours) * 3600, 0)
+    with with_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO raid_schedules (
+                guild_id,
+                channel_id,
+                template_id,
+                name_pattern,
+                comment,
+                max_participants,
+                roles_json,
+                weekday,
+                time_of_day,
+                interval_days,
+                lead_time_hours,
+                reminder_offsets,
+                next_run_at,
+                generate_at,
+                created_by
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                guild_id,
+                channel_id,
+                template_id,
+                name_pattern,
+                comment,
+                max_participants,
+                roles_json,
+                weekday,
+                time_of_day,
+                interval_days,
+                lead_time_hours,
+                reminder_value,
+                next_run_at,
+                generate_at,
+                created_by,
+            ),
+        )
+        schedule_id = int(cur.lastrowid)
+        conn.commit()
+    return schedule_id
+
+
+def update_schedule_next_run(
+    schedule_id: int, *, next_run_at: int, lead_time_hours: int
+) -> None:
+    generate_at = max(next_run_at - int(lead_time_hours) * 3600, 0)
+    with with_conn() as conn:
+        conn.execute(
+            "UPDATE raid_schedules SET next_run_at = ?, generate_at = ? WHERE id = ?",
+            (next_run_at, generate_at, schedule_id),
+        )
+        conn.commit()
+
+
+def delete_schedule(schedule_id: int) -> bool:
+    with with_conn() as conn:
+        cur = conn.execute("DELETE FROM raid_schedules WHERE id = ?", (schedule_id,))
+        conn.commit()
+    return cur.rowcount > 0
+
+
+def list_schedules(guild_id: int) -> List[RaidSchedule]:
+    with with_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM raid_schedules
+            WHERE guild_id = ?
+            ORDER BY next_run_at
+            """,
+            (guild_id,),
+        ).fetchall()
+    return [_row_to_schedule(row) for row in rows]
+
+
+def fetch_schedule(schedule_id: int) -> Optional[RaidSchedule]:
+    with with_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM raid_schedules WHERE id = ?",
+            (schedule_id,),
+        ).fetchone()
+    if not row:
+        return None
+    return _row_to_schedule(row)
+
+
+def list_due_schedules(now_ts: int) -> List[RaidSchedule]:
+    with with_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM raid_schedules WHERE generate_at <= ?",
+            (now_ts,),
+        ).fetchall()
+    return [_row_to_schedule(row) for row in rows]
+
+
 __all__ = [
     "DEFAULT_REMINDER_OFFSETS",
     "add_signup",
     "add_waitlist_entry",
+    "create_schedule",
     "create_raid",
     "delete_raid",
     "delete_raid_reminders",
+    "delete_schedule",
     "delete_template",
     "enforce_signup_limits",
     "fetch_raid",
+    "fetch_schedule",
     "fetch_template",
+    "fetch_template_by_id",
+    "get_raid_reminder_offsets",
     "get_roles",
     "get_signups",
     "get_user_signup",
@@ -674,8 +948,10 @@ __all__ = [
     "get_waitlist_entry",
     "init_db",
     "list_due_reminders",
+    "list_due_schedules",
     "list_raid_ids",
     "list_reminders_for_raid",
+    "list_schedules",
     "list_templates",
     "list_upcoming_raids",
     "mark_reminder_sent",
@@ -684,9 +960,11 @@ __all__ = [
     "remove_waitlist_entry",
     "replace_roles",
     "reset_raid_reminders",
+    "set_raid_reminder_offsets",
     "save_template",
     "update_message_id",
     "update_raid",
+    "update_schedule_next_run",
     "update_signup_role",
     "update_waitlist_role",
     "with_conn",

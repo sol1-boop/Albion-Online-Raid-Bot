@@ -2,20 +2,63 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Sequence, TYPE_CHECKING
 
 import discord
 from discord import app_commands
 
 import db
 from config import TIME_FMT
-from utils import ensure_permissions, make_embed, parse_roles, parse_time_local
+from scheduler import format_offset
+from utils import (
+    compute_next_occurrence,
+    ensure_permissions,
+    make_embed,
+    parse_reminder_offsets,
+    parse_roles,
+    parse_time_local,
+    parse_time_of_day,
+)
+
+if TYPE_CHECKING:
+    from models import RaidSchedule
 from views import SignupView, announce_promotions, refresh_message, sync_roster
 
 raid_group = app_commands.Group(name="raid", description="Рейдовые события Albion Online")
 template_group = app_commands.Group(
     name="template", description="Шаблоны рейдов", parent=raid_group
 )
+schedule_group = app_commands.Group(
+    name="schedule", description="Повторяющиеся события", parent=raid_group
+)
+
+WEEKDAY_CHOICES = [
+    app_commands.Choice(name="Понедельник", value=0),
+    app_commands.Choice(name="Вторник", value=1),
+    app_commands.Choice(name="Среда", value=2),
+    app_commands.Choice(name="Четверг", value=3),
+    app_commands.Choice(name="Пятница", value=4),
+    app_commands.Choice(name="Суббота", value=5),
+    app_commands.Choice(name="Воскресенье", value=6),
+]
+
+WEEKDAY_LABELS = {
+    0: "Пн",
+    1: "Вт",
+    2: "Ср",
+    3: "Чт",
+    4: "Пт",
+    5: "Сб",
+    6: "Вс",
+}
+
+
+def describe_offsets(offsets: Sequence[int]) -> str:
+    if not offsets:
+        default = ", ".join(str(int(v // 60)) for v in db.DEFAULT_REMINDER_OFFSETS)
+        return f"по умолчанию ({default} мин)"
+    formatted = [format_offset(value) for value in sorted(offsets, reverse=True)]
+    return ", ".join(formatted)
 
 PERMISSION_ERROR = (
     "Недостаточно прав: только создатель события или модератор с Manage Events."
@@ -29,6 +72,7 @@ PERMISSION_ERROR = (
     max_participants="Общий лимит участников",
     roles="Роли и лимиты в формате: tank:2, healer:3, dps:10",
     comment="Комментарий (опционально)",
+    reminders="Напоминания в минутах/часах, через запятую (например 120,30m,10m)",
 )
 async def raid_create(
     interaction: discord.Interaction,
@@ -37,10 +81,15 @@ async def raid_create(
     roles: str,
     starts_at: Optional[str] = None,
     comment: Optional[str] = None,
+    reminders: Optional[str] = None,
 ) -> None:
     try:
         dt_utc = parse_time_local(starts_at) if starts_at else None
         roles_map = dict(parse_roles(roles))
+        reminder_offsets: Sequence[int] | None = None
+        if reminders and reminders.strip():
+            parsed_offsets = parse_reminder_offsets(reminders)
+            reminder_offsets = parsed_offsets if parsed_offsets else None
     except Exception as exc:
         await interaction.response.send_message(f"Ошибка: {exc}", ephemeral=True)
         return
@@ -54,6 +103,7 @@ async def raid_create(
         max_participants=int(max_participants),
         created_by=interaction.user.id,
         roles=roles_map,
+        reminder_offsets=reminder_offsets,
     )
 
     raid = db.fetch_raid(raid_id)
@@ -75,6 +125,7 @@ async def raid_create(
     max_participants="Лимит участников",
     roles="Роли и лимиты в формате tank:2, healer:3",
     comment="Комментарий по умолчанию (опционально)",
+    reminders="Напоминания по умолчанию (например 120,30m,10m)",
 )
 async def template_create(
     interaction: discord.Interaction,
@@ -82,9 +133,14 @@ async def template_create(
     max_participants: app_commands.Range[int, 1, 1000],
     roles: str,
     comment: Optional[str] = None,
+    reminders: Optional[str] = None,
 ) -> None:
     try:
         roles_map = dict(parse_roles(roles))
+        reminder_offsets: Sequence[int] | None = None
+        if reminders and reminders.strip():
+            parsed_offsets = parse_reminder_offsets(reminders)
+            reminder_offsets = parsed_offsets if parsed_offsets else None
     except Exception as exc:
         await interaction.response.send_message(f"Ошибка ролей: {exc}", ephemeral=True)
         return
@@ -94,6 +150,7 @@ async def template_create(
         max_participants=int(max_participants),
         roles=roles_map,
         comment=comment or "",
+        reminder_offsets=reminder_offsets,
     )
     await interaction.response.send_message(
         f"Шаблон **{template_name}** сохранён.", ephemeral=True
@@ -109,8 +166,9 @@ async def template_list(interaction: discord.Interaction) -> None:
     lines: list[str] = []
     for tpl in templates:
         roles_text = ", ".join(f"{role}:{cap}" for role, cap in tpl.roles.items())
+        offsets_desc = describe_offsets(tpl.reminder_offsets_tuple)
         lines.append(
-            f"**{tpl.name}** • лимит {tpl.max_participants} • роли: {roles_text}"
+            f"**{tpl.name}** • лимит {tpl.max_participants} • роли: {roles_text} • напоминания: {offsets_desc}"
         )
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
@@ -133,6 +191,7 @@ async def template_delete(interaction: discord.Interaction, template_name: str) 
     starts_at=f"Время старта {TIME_FMT} (опционально)",
     max_participants="Переопределить лимит (опционально)",
     comment="Переопределить комментарий (опционально)",
+    reminders="Переопределить напоминания (например 120,30m,10m)",
 )
 async def template_use(
     interaction: discord.Interaction,
@@ -141,6 +200,7 @@ async def template_use(
     starts_at: Optional[str] = None,
     max_participants: Optional[int] = None,
     comment: Optional[str] = None,
+    reminders: Optional[str] = None,
 ) -> None:
     template = db.fetch_template(int(interaction.guild_id), template_name)
     if not template:
@@ -161,6 +221,15 @@ async def template_use(
             return
         starts_ts = int(dt_utc.timestamp())
 
+    reminder_offsets: Sequence[int] | None = template.reminder_offsets_tuple or None
+    if reminders and reminders.strip():
+        try:
+            parsed_offsets = parse_reminder_offsets(reminders)
+        except Exception as exc:
+            await interaction.response.send_message(f"Ошибка напоминаний: {exc}", ephemeral=True)
+            return
+        reminder_offsets = parsed_offsets if parsed_offsets else None
+
     raid_id = db.create_raid(
         guild_id=int(interaction.guild_id),
         channel_id=int(interaction.channel_id),
@@ -170,6 +239,7 @@ async def template_use(
         max_participants=int(max_participants) if max_participants is not None else template.max_participants,
         created_by=interaction.user.id,
         roles=template.roles,
+        reminder_offsets=reminder_offsets,
     )
 
     raid = db.fetch_raid(raid_id)
@@ -185,6 +255,166 @@ async def template_use(
     db.update_message_id(raid_id, msg.id)
 
 
+@schedule_group.command(name="create", description="Создать расписание повторяющегося рейда")
+@app_commands.describe(
+    name_pattern="Название события (поддерживаются плейсхолдеры strftime, например %d.%m)",
+    template_name="Шаблон рейда",
+    weekday="День недели старта",
+    time_of_day="Время старта (ЧЧ:ММ)",
+    repeat_days="Период повторения в днях (по умолчанию 7)",
+    lead_time_hours="За сколько часов до старта публиковать событие",
+    channel="Канал для публикации (по умолчанию текущий)",
+    max_participants="Переопределить лимит участников",
+    comment="Переопределить комментарий",
+    reminders="Переопределить напоминания (например 120,30m,10m)",
+)
+async def schedule_create(
+    interaction: discord.Interaction,
+    name_pattern: str,
+    template_name: str,
+    weekday: app_commands.Choice[int],
+    time_of_day: str,
+    repeat_days: app_commands.Range[int, 1, 30] = 7,
+    lead_time_hours: Optional[int] = None,
+    channel: Optional[discord.TextChannel] = None,
+    max_participants: Optional[int] = None,
+    comment: Optional[str] = None,
+    reminders: Optional[str] = None,
+) -> None:
+    template = db.fetch_template(int(interaction.guild_id), template_name)
+    if not template:
+        await interaction.response.send_message("Шаблон не найден.", ephemeral=True)
+        return
+    if not template.roles:
+        await interaction.response.send_message(
+            "В шаблоне нет ролей, создание расписания невозможно.", ephemeral=True
+        )
+        return
+    try:
+        hour, minute = parse_time_of_day(time_of_day)
+    except Exception as exc:
+        await interaction.response.send_message(f"Ошибка времени: {exc}", ephemeral=True)
+        return
+    interval_days = int(repeat_days)
+    if lead_time_hours is None:
+        lead_time_value = max(interval_days * 24 - 1, 1)
+    else:
+        if lead_time_hours <= 0:
+            await interaction.response.send_message(
+                "Интервал публикации должен быть больше нуля.", ephemeral=True
+            )
+            return
+        lead_time_value = lead_time_hours
+    if lead_time_value >= interval_days * 24:
+        await interaction.response.send_message(
+            "Период публикации должен быть меньше периода повторения.",
+            ephemeral=True,
+        )
+        return
+    reminder_offsets: Sequence[int] | None = template.reminder_offsets_tuple or None
+    if reminders and reminders.strip():
+        try:
+            parsed_offsets = parse_reminder_offsets(reminders)
+        except Exception as exc:
+            await interaction.response.send_message(f"Ошибка напоминаний: {exc}", ephemeral=True)
+            return
+        reminder_offsets = parsed_offsets if parsed_offsets else None
+    publish_channel: Optional[discord.abc.GuildChannel] = channel or interaction.channel
+    if not isinstance(publish_channel, (discord.TextChannel, discord.Thread)):
+        await interaction.response.send_message(
+            "Расписания поддерживаются только для текстовых каналов и тредов.",
+            ephemeral=True,
+        )
+        return
+    starts_dt = compute_next_occurrence(weekday.value, hour, minute)
+    next_run_at = int(starts_dt.timestamp())
+    schedule_id = db.create_schedule(
+        guild_id=int(interaction.guild_id),
+        channel_id=int(publish_channel.id),
+        template_id=template.id,
+        name_pattern=name_pattern,
+        comment=comment if comment is not None else template.comment,
+        max_participants=int(max_participants) if max_participants is not None else template.max_participants,
+        roles_json=template.roles_json,
+        weekday=int(weekday.value),
+        time_of_day=f"{hour:02d}:{minute:02d}",
+        interval_days=interval_days,
+        lead_time_hours=lead_time_value,
+        reminder_offsets=reminder_offsets,
+        next_run_at=next_run_at,
+        created_by=interaction.user.id,
+    )
+    schedule = db.fetch_schedule(schedule_id)
+    when_text = datetime.fromtimestamp(next_run_at, tz=timezone.utc).astimezone().strftime(TIME_FMT)
+    offsets_desc = describe_offsets(
+        schedule.reminder_offsets_tuple if schedule else (reminder_offsets or ())
+    )
+    created_now = False
+    if schedule:
+        from scheduler import maybe_generate_schedule_event
+
+        created_now = await maybe_generate_schedule_event(interaction.client, schedule)
+    channel_mention = publish_channel.mention if hasattr(publish_channel, "mention") else f"#{publish_channel}"
+    message = (
+        f"Расписание #{schedule_id} создано. Следующий рейд {when_text} в {channel_mention}."
+        f" Напоминания: {offsets_desc}."
+    )
+    if created_now:
+        message += " Первый рейд опубликован автоматически."
+    await interaction.response.send_message(message, ephemeral=True)
+
+
+def _has_schedule_permissions(
+    interaction: discord.Interaction, schedule: "RaidSchedule"
+) -> bool:
+    if interaction.user.id == schedule.created_by:
+        return True
+    perms = getattr(interaction.user, "guild_permissions", None)
+    return bool(perms and (getattr(perms, "manage_events", False) or getattr(perms, "manage_guild", False)))
+
+
+@schedule_group.command(name="list", description="Показать расписания гильдии")
+async def schedule_list(interaction: discord.Interaction) -> None:
+    schedules = db.list_schedules(int(interaction.guild_id))
+    if not schedules:
+        await interaction.response.send_message("Расписания не найдены.", ephemeral=True)
+        return
+    lines: list[str] = []
+    for schedule in schedules:
+        template_name = "—"
+        if schedule.template_id:
+            template = db.fetch_template_by_id(schedule.template_id)
+            if template:
+                template_name = template.name
+        next_text = datetime.fromtimestamp(schedule.next_run_at, tz=timezone.utc).astimezone().strftime(TIME_FMT)
+        offsets_desc = describe_offsets(schedule.reminder_offsets_tuple)
+        channel_obj = interaction.guild.get_channel(schedule.channel_id) if interaction.guild else None
+        channel_display = channel_obj.mention if channel_obj else f"#{schedule.channel_id}"
+        lines.append(
+            f"#{schedule.id} • {WEEKDAY_LABELS.get(schedule.weekday, schedule.weekday)} {schedule.time_of_day}"
+            f" • следующий {next_text} • канал {channel_display}"
+            f" • шаблон {template_name} • каждые {schedule.interval_days} дн • создаётся за {schedule.lead_time_hours} ч"
+            f" • напоминания: {offsets_desc}"
+        )
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
+@schedule_group.command(name="delete", description="Удалить расписание")
+@app_commands.describe(schedule_id="ID расписания")
+async def schedule_delete(interaction: discord.Interaction, schedule_id: int) -> None:
+    schedule = db.fetch_schedule(schedule_id)
+    if not schedule or schedule.guild_id != int(interaction.guild_id):
+        await interaction.response.send_message("Расписание не найдено.", ephemeral=True)
+        return
+    if not _has_schedule_permissions(interaction, schedule):
+        await interaction.response.send_message(PERMISSION_ERROR, ephemeral=True)
+        return
+    db.delete_schedule(schedule_id)
+    await interaction.response.send_message(
+        f"Расписание #{schedule_id} удалено. Уже созданные события останутся.", ephemeral=True
+    )
+
+
 @raid_group.command(name="clone", description="Клонировать существующее событие")
 @app_commands.describe(
     source_raid_id="ID события для копирования",
@@ -192,6 +422,7 @@ async def template_use(
     starts_at=f"Новое время {TIME_FMT} (опционально)",
     max_participants="Новый лимит (опционально)",
     comment="Комментарий (опционально, по умолчанию как у исходного)",
+    reminders="Переопределить напоминания (например 120,30m,10m)",
 )
 async def raid_clone(
     interaction: discord.Interaction,
@@ -200,6 +431,7 @@ async def raid_clone(
     starts_at: Optional[str] = None,
     max_participants: Optional[int] = None,
     comment: Optional[str] = None,
+    reminders: Optional[str] = None,
 ) -> None:
     source = db.fetch_raid(source_raid_id)
     if not source:
@@ -224,6 +456,15 @@ async def raid_clone(
             return
         starts_ts = int(dt_utc.timestamp())
 
+    reminder_offsets: Sequence[int] | None = source.reminder_offsets_tuple or None
+    if reminders and reminders.strip():
+        try:
+            parsed_offsets = parse_reminder_offsets(reminders)
+        except Exception as exc:
+            await interaction.response.send_message(f"Ошибка напоминаний: {exc}", ephemeral=True)
+            return
+        reminder_offsets = parsed_offsets if parsed_offsets else None
+
     raid_id = db.create_raid(
         guild_id=int(interaction.guild_id),
         channel_id=int(interaction.channel_id),
@@ -233,6 +474,7 @@ async def raid_clone(
         max_participants=int(max_participants) if max_participants is not None else source.max_participants,
         created_by=interaction.user.id,
         roles=roles_map,
+        reminder_offsets=reminder_offsets,
     )
 
     raid = db.fetch_raid(raid_id)
@@ -256,6 +498,7 @@ async def raid_clone(
     max_participants="Новый общий лимит (опционально)",
     roles="Полный список ролей и лимитов (заменит существующие)",
     comment="Новый комментарий (опционально)",
+    reminders="Новый список напоминаний или 'default' для сброса",
 )
 async def raid_edit(
     interaction: discord.Interaction,
@@ -265,6 +508,7 @@ async def raid_edit(
     max_participants: Optional[int] = None,
     roles: Optional[str] = None,
     comment: Optional[str] = None,
+    reminders: Optional[str] = None,
 ) -> None:
     raid = db.fetch_raid(raid_id)
     if not raid:
@@ -304,8 +548,28 @@ async def raid_edit(
 
     limit_changes = db.enforce_signup_limits(raid_id)
     updated_raid = db.fetch_raid(raid_id)
-    if updated_raid and new_starts_at is not None:
-        db.reset_raid_reminders(raid_id, updated_raid.starts_at)
+    reminder_offsets_override: Sequence[int] | None = None
+    if reminders is not None:
+        text = reminders.strip().lower()
+        if not text or text in {"default", "reset"}:
+            reminder_offsets_override = tuple(db.DEFAULT_REMINDER_OFFSETS)
+        else:
+            try:
+                parsed = parse_reminder_offsets(reminders)
+            except Exception as exc:
+                await interaction.response.send_message(
+                    f"Ошибка напоминаний: {exc}", ephemeral=True
+                )
+                return
+            reminder_offsets_override = parsed if parsed else tuple(db.DEFAULT_REMINDER_OFFSETS)
+    if updated_raid:
+        if new_starts_at is not None or reminder_offsets_override is not None:
+            offsets_to_use = (
+                reminder_offsets_override
+                if reminder_offsets_override is not None
+                else None
+            )
+            db.reset_raid_reminders(raid_id, updated_raid.starts_at, offsets_to_use)
 
     promotions: list[tuple[int, str]] = []
     if updated_raid:
@@ -326,6 +590,12 @@ async def raid_edit(
     if promotions:
         promo_text = ", ".join(f"<@{uid}> ({role})" for uid, role in promotions)
         parts.append("Автоматически добавлены из резерва: " + promo_text + ".")
+    if reminder_offsets_override is not None:
+        parts.append(
+            "Напоминания обновлены: "
+            + describe_offsets(reminder_offsets_override)
+            + "."
+        )
 
     await interaction.response.send_message(" ".join(parts), ephemeral=True)
 
@@ -393,4 +663,5 @@ async def raid_list(
 
 __all__ = [
     "raid_group",
+    "schedule_group",
 ]

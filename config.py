@@ -22,7 +22,7 @@ if not TOKEN:
     if token_file.exists():
         TOKEN = token_file.read_text(encoding="utf-8").strip()
 
-TIME_FMT = "%H:%M %d.%m.%Y"  # e.g. 22:00 30.09.2025
+TIME_FMT = "%H:%M %d.%m.%y"  # e.g. 22:00 30.09.25
 
 logging.basicConfig(
     level=logging.INFO,

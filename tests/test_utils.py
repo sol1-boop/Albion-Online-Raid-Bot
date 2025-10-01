@@ -28,8 +28,23 @@ def test_parse_roles_errors() -> None:
 
 
 def test_parse_time_local_returns_utc() -> None:
-    dt = utils.parse_time_local("20:30 30.09.2025")
+    dt = utils.parse_time_local("20:30 30.09.25")
     assert dt.tzinfo == timezone.utc
+
+
+def test_parse_time_of_day() -> None:
+    assert utils.parse_time_of_day("09:15") == (9, 15)
+    with pytest.raises(ValueError):
+        utils.parse_time_of_day("25:00")
+    with pytest.raises(ValueError):
+        utils.parse_time_of_day("bad")
+
+
+def test_parse_reminder_offsets() -> None:
+    assert utils.parse_reminder_offsets("60,30m,1h") == (3600, 1800, 3600)
+    assert utils.parse_reminder_offsets(None) == ()
+    with pytest.raises(ValueError):
+        utils.parse_reminder_offsets("-10")
 
 
 def test_raid_starts_dt_property() -> None:
@@ -44,6 +59,7 @@ def test_raid_starts_dt_property() -> None:
         max_participants=1,
         created_by=1,
         created_at=1,
+        reminder_offsets="",
     )
     assert raid.starts_dt is None
 
