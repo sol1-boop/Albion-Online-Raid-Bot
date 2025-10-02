@@ -336,18 +336,23 @@ class TemplateCreateModal(discord.ui.Modal):
         super().__init__(title="Создать шаблон")
         self.management_view = management_view
         self.template_name = discord.ui.TextInput(label="Название шаблона", max_length=100)
+        self.add_item(self.template_name)
         self.max_participants = discord.ui.TextInput(
             label="Лимит участников", placeholder="Например 20"
         )
+        self.add_item(self.max_participants)
         self.roles = discord.ui.TextInput(
             label="Роли и лимиты", placeholder="tank:2, healer:3"
         )
+        self.add_item(self.roles)
         self.comment = discord.ui.TextInput(
             label="Комментарий", style=discord.TextStyle.paragraph, required=False
         )
+        self.add_item(self.comment)
         self.reminders = discord.ui.TextInput(
             label="Напоминания", required=False, placeholder="120,30m,10m"
         )
+        self.add_item(self.reminders)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:  # pragma: no cover - UI callback
         try:
@@ -380,18 +385,23 @@ class TemplateUseModal(discord.ui.Modal):
         self.event_name = discord.ui.TextInput(
             label="Название рейда", default=template_name, max_length=100
         )
+        self.add_item(self.event_name)
         self.starts_at = discord.ui.TextInput(
             label="Время старта", required=False, placeholder=TIME_FMT
         )
+        self.add_item(self.starts_at)
         self.max_participants = discord.ui.TextInput(
             label="Лимит участников", required=False
         )
+        self.add_item(self.max_participants)
         self.comment = discord.ui.TextInput(
             label="Комментарий", style=discord.TextStyle.paragraph, required=False
         )
+        self.add_item(self.comment)
         self.reminders = discord.ui.TextInput(
             label="Напоминания", required=False, placeholder="120,30m,10m"
         )
+        self.add_item(self.reminders)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:  # pragma: no cover - UI callback
         starts_at_value = self.starts_at.value.strip() or None
