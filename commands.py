@@ -9,7 +9,13 @@ from discord import app_commands
 
 import db
 from config import TIME_FMT
-from scheduler import format_offset
+from template_actions import (
+    create_or_update_template,
+    delete_template,
+    describe_offsets,
+    instantiate_template,
+    list_templates_description,
+)
 from utils import (
     compute_next_occurrence,
     ensure_permissions,
@@ -22,7 +28,13 @@ from utils import (
 
 if TYPE_CHECKING:
     from models import RaidSchedule
-from views import SignupView, announce_promotions, refresh_message, sync_roster
+from views import (
+    SignupView,
+    TemplateManagementView,
+    announce_promotions,
+    refresh_message,
+    sync_roster,
+)
 
 raid_group = app_commands.Group(name="raid", description="Рейдовые события Albion Online")
 template_group = app_commands.Group(
@@ -52,13 +64,6 @@ WEEKDAY_LABELS = {
     6: "Вс",
 }
 
-
-def describe_offsets(offsets: Sequence[int]) -> str:
-    if not offsets:
-        default = ", ".join(str(int(v // 60)) for v in db.DEFAULT_REMINDER_OFFSETS)
-        return f"по умолчанию ({default} мин)"
-    formatted = [format_offset(value) for value in sorted(offsets, reverse=True)]
-    return ", ".join(formatted)
 
 PERMISSION_ERROR = (
     "Недостаточно прав: только создатель события или модератор с Manage Events."
@@ -142,51 +147,47 @@ async def template_create(
     reminders: Optional[str] = None,
 ) -> None:
     try:
-        roles_map = dict(parse_roles(roles))
-        reminder_offsets: Sequence[int] | None = None
-        if reminders and reminders.strip():
-            parsed_offsets = parse_reminder_offsets(reminders)
-            reminder_offsets = parsed_offsets if parsed_offsets else None
+        message = create_or_update_template(
+            guild_id=int(interaction.guild_id),
+            template_name=template_name,
+            max_participants=int(max_participants),
+            roles=roles,
+            comment=comment,
+            reminders=reminders,
+        )
     except Exception as exc:
-        await interaction.response.send_message(f"Ошибка ролей: {exc}", ephemeral=True)
+        await interaction.response.send_message(f"Ошибка: {exc}", ephemeral=True)
         return
-    db.save_template(
-        guild_id=int(interaction.guild_id),
-        name=template_name,
-        max_participants=int(max_participants),
-        roles=roles_map,
-        comment=comment or "",
-        reminder_offsets=reminder_offsets,
-    )
-    await interaction.response.send_message(
-        f"Шаблон **{template_name}** сохранён.", ephemeral=True
-    )
+    await interaction.response.send_message(message, ephemeral=True)
 
 
 @template_group.command(name="list", description="Показать шаблоны сервера")
 async def template_list(interaction: discord.Interaction) -> None:
-    templates = db.list_templates(int(interaction.guild_id))
-    if not templates:
-        await interaction.response.send_message("Шаблонов пока нет.", ephemeral=True)
-        return
-    lines: list[str] = []
-    for tpl in templates:
-        roles_text = ", ".join(f"{role}:{cap}" for role, cap in tpl.roles.items())
-        offsets_desc = describe_offsets(tpl.reminder_offsets_tuple)
-        lines.append(
-            f"**{tpl.name}** • лимит {tpl.max_participants} • роли: {roles_text} • напоминания: {offsets_desc}"
-        )
-    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+    description, _ = list_templates_description(int(interaction.guild_id))
+    view = TemplateManagementView(
+        guild_id=int(interaction.guild_id),
+        channel_id=int(interaction.channel_id),
+    )
+    await interaction.response.send_message(
+        description,
+        ephemeral=True,
+        view=view,
+    )
+
+
+@template_group.command(name="manage", description="Управление шаблонами через меню")
+async def template_manage(interaction: discord.Interaction) -> None:
+    await template_list(interaction)
 
 
 @template_group.command(name="delete", description="Удалить шаблон")
 @app_commands.describe(template_name="Название шаблона")
 async def template_delete(interaction: discord.Interaction, template_name: str) -> None:
-    deleted = db.delete_template(int(interaction.guild_id), template_name)
-    if deleted:
-        message = f"Шаблон **{template_name}** удалён."
-    else:
-        message = "Шаблон не найден."
+    try:
+        message = delete_template(int(interaction.guild_id), template_name)
+    except ValueError as exc:
+        await interaction.response.send_message(f"Ошибка: {exc}", ephemeral=True)
+        return
     await interaction.response.send_message(message, ephemeral=True)
 
 
@@ -208,58 +209,27 @@ async def template_use(
     comment: Optional[str] = None,
     reminders: Optional[str] = None,
 ) -> None:
-    template = db.fetch_template(int(interaction.guild_id), template_name)
-    if not template:
-        await interaction.response.send_message("Шаблон не найден.", ephemeral=True)
-        return
-    if not template.roles:
-        await interaction.response.send_message(
-            "В шаблоне нет ролей, создание невозможно.", ephemeral=True
+    try:
+        raid, roles_data, signups, waitlist = instantiate_template(
+            guild_id=int(interaction.guild_id),
+            channel_id=int(interaction.channel_id),
+            author_id=interaction.user.id,
+            template_name=template_name,
+            event_name=name,
+            starts_at=starts_at,
+            max_participants=max_participants,
+            comment=comment,
+            reminders=reminders,
         )
+    except Exception as exc:
+        await interaction.response.send_message(f"Ошибка: {exc}", ephemeral=True)
         return
 
-    starts_ts = 0
-    if starts_at:
-        try:
-            dt_utc = parse_time_local(starts_at)
-        except Exception as exc:
-            await interaction.response.send_message(f"Ошибка времени: {exc}", ephemeral=True)
-            return
-        starts_ts = int(dt_utc.timestamp())
-
-    reminder_offsets: Sequence[int] | None = template.reminder_offsets_tuple or None
-    if reminders and reminders.strip():
-        try:
-            parsed_offsets = parse_reminder_offsets(reminders)
-        except Exception as exc:
-            await interaction.response.send_message(f"Ошибка напоминаний: {exc}", ephemeral=True)
-            return
-        reminder_offsets = parsed_offsets if parsed_offsets else None
-
-    raid_id = db.create_raid(
-        guild_id=int(interaction.guild_id),
-        channel_id=int(interaction.channel_id),
-        name=name,
-        starts_at=starts_ts,
-        comment=comment if comment is not None else template.comment,
-        max_participants=int(max_participants) if max_participants is not None else template.max_participants,
-        created_by=interaction.user.id,
-        roles=template.roles,
-        reminder_offsets=reminder_offsets,
-    )
-
-    raid = db.fetch_raid(raid_id)
-    assert raid is not None
-    db.reset_raid_reminders(raid_id, raid.starts_at)
-    roles_data = db.get_roles(raid_id)
-    signups = db.get_signups(raid_id)
-    waitlist = db.get_waitlist(raid_id)
     embed = make_embed(raid, roles_data, signups, waitlist)
     view = SignupView(raid.id)
     await interaction.response.send_message(embed=embed, view=view)
     msg = await interaction.original_response()
-    db.update_message_id(raid_id, msg.id)
-
+    db.update_message_id(raid.id, msg.id)
 
 @schedule_group.command(name="create", description="Создать расписание повторяющегося рейда")
 @app_commands.describe(
