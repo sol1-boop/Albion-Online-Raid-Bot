@@ -161,8 +161,7 @@ async def template_create(
     await interaction.response.send_message(message, ephemeral=True)
 
 
-@template_group.command(name="list", description="Показать шаблоны сервера")
-async def template_list(interaction: discord.Interaction) -> None:
+async def _respond_with_template_list(interaction: discord.Interaction) -> None:
     description, _ = list_templates_description(int(interaction.guild_id))
     view = TemplateManagementView(
         guild_id=int(interaction.guild_id),
@@ -175,9 +174,14 @@ async def template_list(interaction: discord.Interaction) -> None:
     )
 
 
+@template_group.command(name="list", description="Показать шаблоны сервера")
+async def template_list(interaction: discord.Interaction) -> None:
+    await _respond_with_template_list(interaction)
+
+
 @template_group.command(name="manage", description="Управление шаблонами через меню")
 async def template_manage(interaction: discord.Interaction) -> None:
-    await template_list(interaction)
+    await _respond_with_template_list(interaction)
 
 
 @template_group.command(name="delete", description="Удалить шаблон")
